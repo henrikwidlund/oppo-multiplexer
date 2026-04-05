@@ -1,0 +1,96 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  release:
+    name: Release native binaries
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_ext: ""
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin_ext: ""
+          - os: macos
+            arch: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bin_ext: ""
+          - os: macos
+            arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bin_ext: ""
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_ext: .exe
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bin_ext: .exe
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Pack
+        shell: bash
+        run: |
+          release_name="oppo-multiplexer-${{ matrix.os }}-${{ matrix.arch }}"
+          binary="target/${{ matrix.target }}/release/oppo-multiplexer${{ matrix.bin_ext }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            7z a -tzip "${release_name}.zip" "$binary"
+          else
+            tar -czvf "${release_name}.tar.gz" -C "target/${{ matrix.target }}/release" "oppo-multiplexer"
+          fi
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
+        with:
+          files: |
+            oppo-multiplexer*.zip
+            oppo-multiplexer*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@v4.1.0
+        with:
+          subject-path: |
+            oppo-multiplexer*.tar.gz
+            oppo-multiplexer*.zip

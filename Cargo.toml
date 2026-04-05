@@ -1,0 +1,18 @@
+[package]
+name = "oppo-multiplexer"
+version = "0.0.1"
+edition = "2024"
+description = "Multiplexes client connections onto a single TCP connection to the Oppo Blu-ray Player, broadcasting unsolicited updates to all clients"
+
+[dependencies]
+smol = "2"
+futures-lite = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing-journald = "0.3"
+
+[profile.release]
+opt-level = "z"
+strip = true
