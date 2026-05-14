@@ -579,6 +579,9 @@ async fn handle_client(
 
         match client.read_until(b'\r', &mut msg).await {
             Ok(0) | Err(_) => break,
+            // EOF mid-line: forwarding a truncated command to the player could
+            // make it execute something partial. Treat as a disconnect.
+            Ok(_) if msg.last() != Some(&b'\r') => break,
             Ok(_) => {}
         }
 
@@ -640,13 +643,13 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
     // Keep the locked section as short as possible — the executor thread is
     // blocked while we hold this std::sync::Mutex. Inside the lock we only do
     // non-blocking work (try_send + bookkeeping).
-    let mut delivered: Vec<u64> = Vec::new();
+    let mut delivered: usize = 0;
     let mut stale: Vec<(u64, TcpStream)> = Vec::new();
     {
         let mut guard = lock_clients(clients);
         guard.retain(|id, (tx, stream)| match tx.try_send(Arc::clone(&shared)) {
             Ok(()) => {
-                delivered.push(*id);
+                delivered += 1;
                 true
             }
             Err(TrySendError::Closed(_)) => false,
@@ -657,11 +660,10 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
         });
     }
 
-    if !delivered.is_empty() {
+    if delivered > 0 {
         debug!(
-            "broadcast '{}' to {} client(s)",
+            "broadcast '{}' to {delivered} client(s)",
             String::from_utf8_lossy(&shared).trim_end_matches('\r'),
-            delivered.len()
         );
     }
 
