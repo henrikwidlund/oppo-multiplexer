@@ -67,9 +67,14 @@ impl Backoff {
     }
 }
 
-type Clients = Arc<Mutex<HashMap<u64, Sender<Arc<[u8]>>>>>;
+/// Per-client state held in the broadcast map. The `TcpStream` clone is kept so
+/// that a stuck/dead client can be force-disconnected from the broadcast path,
+/// which makes both the writer and the reader half of `handle_client` error out
+/// and clean up — instead of leaving the client task running on a broken socket.
+type ClientEntry = (Sender<Arc<[u8]>>, TcpStream);
+type Clients = Arc<Mutex<HashMap<u64, ClientEntry>>>;
 
-fn lock_clients(clients: &Clients) -> MutexGuard<'_, HashMap<u64, Sender<Arc<[u8]>>>> {
+fn lock_clients(clients: &Clients) -> MutexGuard<'_, HashMap<u64, ClientEntry>> {
     clients.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -516,13 +521,17 @@ async fn handle_client(
         .into();
     let _ = stream.set_nodelay(true);
 
+    // Three TcpStream clones share the same underlying socket: one for the
+    // writer task, one stored in the clients map so broadcast can force a
+    // shutdown if the client falls fatally behind, one consumed by BufReader.
     let writer_stream = stream.clone();
+    let map_stream = stream.clone();
     let mut client = BufReader::with_capacity(256, stream);
 
     let (out_tx, out_rx) = channel::bounded::<Arc<[u8]>>(CLIENT_OUT_CAP);
     {
         let mut guard = lock_clients(&clients);
-        guard.insert(client_id, out_tx.clone());
+        guard.insert(client_id, (out_tx.clone(), map_stream));
     }
 
     let writer_peer = Arc::clone(&peer);
@@ -599,9 +608,11 @@ fn is_backend_update(line: &[u8]) -> bool {
 }
 
 fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
+    // Accept owned data so callers can hand off a Vec<u8> for a zero-copy
+    // conversion into Arc<[u8]>. Borrowed slices still work via Arc::from(&[u8]).
     let shared: Arc<[u8]> = line.into();
     let mut guard = lock_clients(clients);
-    guard.retain(|id, tx| match tx.try_send(Arc::clone(&shared)) {
+    guard.retain(|id, (tx, stream)| match tx.try_send(Arc::clone(&shared)) {
         Ok(()) => {
             debug!(
                 "[backend → client {id}] {}",
@@ -612,8 +623,14 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
         Err(TrySendError::Closed(_)) => false,
         Err(TrySendError::Full(_)) => {
             // At ~1 Hz sustained events, a full 256-deep buffer means the client
-            // hasn't drained anything in ~4 minutes. Client is dead.
-            warn!("client {id} send buffer full, dropping client");
+            // hasn't drained anything in ~4 minutes — the socket is broken.
+            // Force a shutdown so the writer's write_all errors out, the reader
+            // half of handle_client breaks, and the whole client task tears down.
+            // Just removing this entry would only stop broadcasts; the broken
+            // task would otherwise linger until the kernel's TCP keepalive
+            // eventually resets the connection.
+            warn!("client {id} send buffer full, force-disconnecting");
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             false
         }
     });
