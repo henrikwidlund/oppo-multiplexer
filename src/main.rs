@@ -234,6 +234,16 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                     .await;
                 return;
             }
+            Ok(_) if buf.last() != Some(&b'\r') => {
+                // EOF was hit after partial bytes were read but before the terminator.
+                // Forwarding a truncated line would corrupt either a broadcast or an
+                // in-flight response, so treat this as a fatal read error and let the
+                // broker surface it / drop the connection.
+                let _ = tx
+                    .send(BackendEvent::Error("backend closed mid-line".to_string()))
+                    .await;
+                return;
+            }
             Ok(_) => {
                 // Hand the filled buffer off and pre-allocate a fresh one in its
                 // place. capacity().max(256) preserves the high-water mark so a
@@ -626,27 +636,42 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
     // Accept owned data so callers can hand off a Vec<u8> for a zero-copy
     // conversion into Arc<[u8]>. Borrowed slices still work via Arc::from(&[u8]).
     let shared: Arc<[u8]> = line.into();
-    let mut guard = lock_clients(clients);
-    guard.retain(|id, (tx, stream)| match tx.try_send(Arc::clone(&shared)) {
-        Ok(()) => {
-            debug!(
-                "[backend → client {id}] {}",
-                String::from_utf8_lossy(&shared).trim_end_matches('\r')
-            );
-            true
-        }
-        Err(TrySendError::Closed(_)) => false,
-        Err(TrySendError::Full(_)) => {
-            // At ~1 Hz sustained events, a full 256-deep buffer means the client
-            // hasn't drained anything in ~4 minutes — the socket is broken.
-            // Force a shutdown so the writer's write_all errors out, the reader
-            // half of handle_client breaks, and the whole client task tears down.
-            // Just removing this entry would only stop broadcasts; the broken
-            // task would otherwise linger until the kernel's TCP keepalive
-            // eventually resets the connection.
-            warn!("client {id} send buffer full, force-disconnecting");
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            false
-        }
-    });
+
+    // Keep the locked section as short as possible — the executor thread is
+    // blocked while we hold this std::sync::Mutex. Inside the lock we only do
+    // non-blocking work (try_send + bookkeeping).
+    let mut delivered: Vec<u64> = Vec::new();
+    let mut stale: Vec<(u64, TcpStream)> = Vec::new();
+    {
+        let mut guard = lock_clients(clients);
+        guard.retain(|id, (tx, stream)| match tx.try_send(Arc::clone(&shared)) {
+            Ok(()) => {
+                delivered.push(*id);
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+            Err(TrySendError::Full(_)) => {
+                stale.push((*id, stream.clone()));
+                false
+            }
+        });
+    }
+
+    if !delivered.is_empty() {
+        debug!(
+            "broadcast '{}' to {} client(s)",
+            String::from_utf8_lossy(&shared).trim_end_matches('\r'),
+            delivered.len()
+        );
+    }
+
+    // For each stale client: force-disconnect so its handle_client task tears
+    // down promptly. Without this, removing the entry would only stop broadcasts
+    // and the broken task would linger until kernel TCP keepalive
+    // eventually reset the connection. At ~1 Hz sustained events, a
+    // full 256-deep buffer means the client hasn't drained for ~4 minutes.
+    for (id, stream) in stale {
+        warn!("client {id} send buffer full, force-disconnecting");
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
 }
