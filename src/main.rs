@@ -219,9 +219,10 @@ async fn try_connect(
 
 async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     let mut reader = BufReader::with_capacity(256, stream);
+    let mut buf = Vec::with_capacity(256);
     loop {
-        let mut line = Vec::with_capacity(256);
-        match reader.read_until(b'\r', &mut line).await {
+        buf.clear();
+        match reader.read_until(b'\r', &mut buf).await {
             Ok(0) => {
                 let _ = tx
                     .send(BackendEvent::Error("backend closed connection".to_string()))
@@ -229,7 +230,7 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                 return;
             }
             Ok(_) => {
-                if tx.send(BackendEvent::Line(line)).await.is_err() {
+                if tx.send(BackendEvent::Line(buf.split_off(0))).await.is_err() {
                     return;
                 }
             }
@@ -415,6 +416,7 @@ async fn handle_new_request(
         }
         Err(e) => {
             *backend = None;
+            backoff.on_failure();
             let _ = req
                 .response_tx
                 .send(Err(format!("backend write error: {e}")))
@@ -473,10 +475,9 @@ async fn handle_client(
         let (response_tx, response_rx) = channel::bounded(1);
         let req = BackendRequest {
             peer: Arc::clone(&peer),
-            msg: std::mem::take(&mut msg),
+            msg: msg.split_off(0),
             response_tx,
         };
-        msg = Vec::with_capacity(256);
 
         if request_tx.send(req).await.is_err() {
             let _ = out_tx
