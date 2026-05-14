@@ -34,6 +34,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct Backoff {
     current: Duration,
+    next_attempt_at: Instant,
 }
 
 impl Backoff {
@@ -41,19 +42,28 @@ impl Backoff {
     const MAX: Duration = Duration::from_secs(15);
 
     fn new() -> Self {
-        Self { current: Duration::ZERO }
+        Self {
+            current: Duration::ZERO,
+            next_attempt_at: Instant::now(),
+        }
     }
 
-    fn current(&self) -> Duration {
-        self.current
+    fn is_ready(&self) -> bool {
+        Instant::now() >= self.next_attempt_at
+    }
+
+    fn delay_until_ready(&self) -> Duration {
+        self.next_attempt_at.saturating_duration_since(Instant::now())
     }
 
     fn on_success(&mut self) {
         self.current = Duration::ZERO;
+        self.next_attempt_at = Instant::now();
     }
 
     fn on_failure(&mut self) {
         self.current = (self.current + Self::STEP).min(Self::MAX);
+        self.next_attempt_at = Instant::now() + self.current;
     }
 }
 
@@ -281,7 +291,7 @@ async fn backend_broker(
                         Err(_) => BrokerEvent::RequestsClosed,
                     }
                 };
-                future::or(backend_fut, request_fut).await
+                future::or(request_fut, backend_fut).await
             }
             (None, _) => {
                 let request_fut = async {
@@ -290,7 +300,7 @@ async fn backend_broker(
                         Err(_) => BrokerEvent::RequestsClosed,
                     }
                 };
-                let delay = backoff.current();
+                let delay = backoff.delay_until_ready();
                 let reconnect_fut = async move {
                     Timer::after(delay).await;
                     BrokerEvent::ReconnectTick
@@ -381,6 +391,11 @@ async fn handle_new_request(
                 *backend = None;
             }
         }
+    }
+
+    if !backoff.is_ready() {
+        let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
+        return;
     }
 
     *backend = try_connect(backend_addr, spawner, backoff).await;
