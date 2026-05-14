@@ -230,7 +230,7 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                 return;
             }
             Ok(_) => {
-                if tx.send(BackendEvent::Line(buf.split_off(0))).await.is_err() {
+                if tx.send(BackendEvent::Line(std::mem::take(&mut buf))).await.is_err() {
                     return;
                 }
             }
@@ -270,7 +270,7 @@ async fn backend_broker(
                         match conn.events.try_recv() {
                             Ok(BackendEvent::Line(line)) => {
                                 if is_backend_update(&line) {
-                                    broadcast_update(&clients, &line);
+                                    broadcast_update(&clients, line);
                                     continue;
                                 }
                                 result = BrokerEvent::Backend(BackendEvent::Line(line));
@@ -355,7 +355,7 @@ async fn backend_broker(
             }
             BrokerEvent::Backend(BackendEvent::Line(line)) => {
                 if is_backend_update(&line) {
-                    broadcast_update(&clients, &line);
+                    broadcast_update(&clients, line);
                 } else if let Some((req, _)) = in_flight.take() {
                     debug!(
                         "[backend → {}] {}",
@@ -509,7 +509,7 @@ async fn handle_client(
         let (response_tx, response_rx) = channel::bounded(1);
         let req = BackendRequest {
             peer: Arc::clone(&peer),
-            msg: msg.split_off(0),
+            msg: std::mem::take(&mut msg),
             response_tx,
         };
 
@@ -553,8 +553,8 @@ fn is_backend_update(line: &[u8]) -> bool {
     UPDATE_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
 }
 
-fn broadcast_update(clients: &Clients, line: &[u8]) {
-    let shared: Arc<[u8]> = Arc::from(line);
+fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
+    let shared: Arc<[u8]> = line.into();
     let mut guard = lock_clients(clients);
     guard.retain(|id, tx| match tx.try_send(Arc::clone(&shared)) {
         Ok(()) => {
