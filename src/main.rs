@@ -240,7 +240,22 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                 // previously-grown buffer doesn't shrink back to the default.
                 let next_capacity = buf.capacity().max(256);
                 let line = std::mem::replace(&mut buf, Vec::with_capacity(next_capacity));
-                if tx.send(BackendEvent::Line(line)).await.is_err() {
+
+                // Updates are fire-and-forget telemetry (a fresh @UTC arrives every
+                // second). If the broker is briefly stalled — e.g. inside a 3s
+                // try_connect — drop the update on Full instead of blocking here.
+                // Blocking would stop draining the TCP socket and could backpressure
+                // the player into stalling its own send queue.
+                //
+                // Responses and protocol errors are not fire-and-forget: we keep the
+                // awaiting send so they cannot be silently lost. At most one response
+                // can be in flight at a time, so this path rarely fills the channel.
+                if is_backend_update(&line) {
+                    match tx.try_send(BackendEvent::Line(line)) {
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Closed(_)) => return,
+                    }
+                } else if tx.send(BackendEvent::Line(line)).await.is_err() {
                     return;
                 }
             }
