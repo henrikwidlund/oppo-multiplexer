@@ -4,10 +4,13 @@ use smol::{
     Executor,
     Timer,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    lock::Mutex,
     net::{TcpListener, TcpStream},
 };
-use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tracing::{debug, error, info, warn};
 
 const UPDATE_PREFIXES: [&[u8]; 11] = [
@@ -24,25 +27,60 @@ const UPDATE_PREFIXES: [&[u8]; 11] = [
     b"@UVO ",
 ];
 
-type Clients = Arc<Mutex<HashMap<u64, Sender<Vec<u8>>>>>;
+const REQUEST_CHANNEL_CAP: usize = 32;
+const CLIENT_OUT_CAP: usize = 256;
+const BACKEND_EVENT_CAP: usize = 32;
+
+struct Backoff {
+    current: Duration,
+}
+
+impl Backoff {
+    const STEP: Duration = Duration::from_millis(500);
+    const MAX: Duration = Duration::from_secs(15);
+
+    fn new() -> Self {
+        Self { current: Duration::ZERO }
+    }
+
+    fn current(&self) -> Duration {
+        self.current
+    }
+
+    fn on_success(&mut self) {
+        self.current = Duration::ZERO;
+    }
+
+    fn on_failure(&mut self) {
+        self.current = (self.current + Self::STEP).min(Self::MAX);
+    }
+}
+
+type Clients = Arc<Mutex<HashMap<u64, Sender<Arc<[u8]>>>>>;
 
 struct BackendRequest {
-    peer: String,
+    peer: Arc<str>,
     msg: Vec<u8>,
     response_tx: Sender<Result<Vec<u8>, String>>,
 }
 
-enum BrokerEvent {
-    Request(BackendRequest),
-    BackendLine(Vec<u8>),
-    BackendError(String),
-    ReconnectTick,
-    RequestsClosed,
+enum BackendEvent {
+    Line(Vec<u8>),
+    Error(String),
 }
 
-enum ReadLineOutcome {
-    Line,
-    TimedOut,
+struct BackendConn {
+    writer: TcpStream,
+    events: Receiver<BackendEvent>,
+    _reader_task: smol::Task<()>,
+}
+
+enum BrokerEvent {
+    Request(BackendRequest),
+    Backend(BackendEvent),
+    Timeout,
+    ReconnectTick,
+    RequestsClosed,
 }
 
 #[cfg(target_os = "linux")]
@@ -83,16 +121,18 @@ fn main() {
 
     smol::block_on(ex.run(async move {
         let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-        let (request_tx, request_rx) = channel::unbounded::<BackendRequest>();
+        let (request_tx, request_rx) = channel::bounded::<BackendRequest>(REQUEST_CHANNEL_CAP);
 
         let broker_clients = Arc::clone(&clients);
         let broker_backend_addr = Arc::clone(&backend_addr);
+        let broker_spawner = Arc::clone(&spawner);
         spawner
             .spawn(backend_broker(
                 request_rx,
                 broker_clients,
                 broker_backend_addr,
                 timeout,
+                broker_spawner,
             ))
             .detach();
 
@@ -125,17 +165,56 @@ fn main() {
 
 // ---------- helpers ----------
 
-async fn try_connect(addr: &str) -> Option<BufReader<TcpStream>> {
+async fn try_connect(
+    addr: &str,
+    spawner: &Arc<Executor<'static>>,
+    backoff: &mut Backoff,
+) -> Option<BackendConn> {
     match TcpStream::connect(addr).await {
         Ok(stream) => {
             // Disable Nagle's algorithm — we send small commands and need low latency.
             let _ = stream.set_nodelay(true);
             info!("connected to backend at {addr}");
-            Some(BufReader::with_capacity(256, stream))
+            let writer = stream.clone();
+            let (events_tx, events_rx) = channel::bounded::<BackendEvent>(BACKEND_EVENT_CAP);
+            let reader_task = spawner.spawn(backend_reader(stream, events_tx));
+            backoff.on_success();
+            Some(BackendConn {
+                writer,
+                events: events_rx,
+                _reader_task: reader_task,
+            })
         }
         Err(e) => {
             warn!("could not connect to backend at {addr}: {e}");
+            backoff.on_failure();
             None
+        }
+    }
+}
+
+async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
+    let mut reader = BufReader::with_capacity(256, stream);
+    loop {
+        let mut line = Vec::with_capacity(256);
+        match reader.read_until(b'\r', &mut line).await {
+            Ok(0) => {
+                let _ = tx
+                    .send(BackendEvent::Error("backend closed connection".to_string()))
+                    .await;
+                return;
+            }
+            Ok(_) => {
+                if tx.send(BackendEvent::Line(line)).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(BackendEvent::Error(format!("backend read error: {e}")))
+                    .await;
+                return;
+            }
         }
     }
 }
@@ -145,70 +224,111 @@ async fn backend_broker(
     clients: Clients,
     backend_addr: Arc<str>,
     timeout: Duration,
+    spawner: Arc<Executor<'static>>,
 ) {
-    let mut backend = try_connect(&backend_addr).await;
+    let mut backoff = Backoff::new();
+    let mut backend: Option<BackendConn> = try_connect(&backend_addr, &spawner, &mut backoff).await;
+    let mut in_flight: Option<(BackendRequest, Instant)> = None;
 
     loop {
-        let event = if backend.is_some() {
-            let request_fut = async {
-                match request_rx.recv().await {
-                    Ok(req) => BrokerEvent::Request(req),
-                    Err(_) => BrokerEvent::RequestsClosed,
-                }
-            };
-
-            let backend_fut = async {
-                let mut line = Vec::with_capacity(256);
-                match backend
-                    .as_mut()
-                    .expect("backend exists")
-                    .read_until(b'\r', &mut line)
-                    .await
-                {
-                    Ok(0) => BrokerEvent::BackendError("backend closed connection".to_string()),
-                    Ok(_) => BrokerEvent::BackendLine(line),
-                    Err(e) => BrokerEvent::BackendError(format!("backend read error: {e}")),
-                }
-            };
-
-            future::or(request_fut, backend_fut).await
-        } else {
-            let request_fut = async {
-                match request_rx.recv().await {
-                    Ok(req) => BrokerEvent::Request(req),
-                    Err(_) => BrokerEvent::RequestsClosed,
-                }
-            };
-
-            let reconnect_fut = async {
-                Timer::after(Duration::from_secs(1)).await;
-                BrokerEvent::ReconnectTick
-            };
-
-            future::or(request_fut, reconnect_fut).await
+        let event = match (backend.as_ref(), in_flight.as_ref()) {
+            (Some(conn), Some((_, deadline))) => {
+                let backend_fut = async {
+                    match conn.events.recv().await {
+                        Ok(ev) => BrokerEvent::Backend(ev),
+                        Err(_) => BrokerEvent::Backend(BackendEvent::Error(
+                            "backend reader ended".to_string(),
+                        )),
+                    }
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let timeout_fut = async move {
+                    Timer::after(remaining).await;
+                    BrokerEvent::Timeout
+                };
+                future::or(backend_fut, timeout_fut).await
+            }
+            (Some(conn), None) => {
+                let backend_fut = async {
+                    match conn.events.recv().await {
+                        Ok(ev) => BrokerEvent::Backend(ev),
+                        Err(_) => BrokerEvent::Backend(BackendEvent::Error(
+                            "backend reader ended".to_string(),
+                        )),
+                    }
+                };
+                let request_fut = async {
+                    match request_rx.recv().await {
+                        Ok(req) => BrokerEvent::Request(req),
+                        Err(_) => BrokerEvent::RequestsClosed,
+                    }
+                };
+                future::or(backend_fut, request_fut).await
+            }
+            (None, _) => {
+                let request_fut = async {
+                    match request_rx.recv().await {
+                        Ok(req) => BrokerEvent::Request(req),
+                        Err(_) => BrokerEvent::RequestsClosed,
+                    }
+                };
+                let delay = backoff.current();
+                let reconnect_fut = async move {
+                    Timer::after(delay).await;
+                    BrokerEvent::ReconnectTick
+                };
+                future::or(request_fut, reconnect_fut).await
+            }
         };
 
         match event {
             BrokerEvent::Request(req) => {
-                process_request(req, &mut backend, &backend_addr, timeout, &clients).await;
+                handle_new_request(
+                    req,
+                    &mut backend,
+                    &backend_addr,
+                    &spawner,
+                    &mut backoff,
+                    timeout,
+                    &mut in_flight,
+                )
+                .await;
             }
-            BrokerEvent::BackendLine(line) => {
+            BrokerEvent::Backend(BackendEvent::Line(line)) => {
                 if is_backend_update(&line) {
-                    broadcast_update(&clients, &line).await;
+                    broadcast_update(&clients, &line);
+                } else if let Some((req, _)) = in_flight.take() {
+                    debug!(
+                        "[backend → {}] {}",
+                        req.peer,
+                        String::from_utf8_lossy(&line).trim_end_matches('\r')
+                    );
+                    let _ = req.response_tx.send(Ok(line)).await;
                 } else {
                     warn!(
-                        "received unexpected backend line while idle: {}",
+                        "unsolicited non-update backend line: {}",
                         String::from_utf8_lossy(&line).trim_end_matches('\r')
                     );
                 }
             }
-            BrokerEvent::BackendError(reason) => {
+            BrokerEvent::Backend(BackendEvent::Error(reason)) => {
                 warn!("{reason}");
                 backend = None;
+                if let Some((req, _)) = in_flight.take() {
+                    let _ = req.response_tx.send(Err(reason)).await;
+                }
+            }
+            BrokerEvent::Timeout => {
+                if let Some((req, _)) = in_flight.take() {
+                    let reason = format!("backend response timed out ({} s)", timeout.as_secs());
+                    let _ = req.response_tx.send(Err(reason)).await;
+                    // Drop backend: protocol state may be desynced after a missed response.
+                    backend = None;
+                }
             }
             BrokerEvent::ReconnectTick => {
                 if backend.is_none() {
-                    backend = try_connect(&backend_addr).await;
+                    backend = try_connect(&backend_addr, &spawner, &mut backoff).await;
                 }
             }
             BrokerEvent::RequestsClosed => break,
@@ -216,43 +336,56 @@ async fn backend_broker(
     }
 }
 
-async fn process_request(
+async fn handle_new_request(
     req: BackendRequest,
-    backend: &mut Option<BufReader<TcpStream>>,
+    backend: &mut Option<BackendConn>,
     backend_addr: &str,
+    spawner: &Arc<Executor<'static>>,
+    backoff: &mut Backoff,
     timeout: Duration,
-    clients: &Clients,
+    in_flight: &mut Option<(BackendRequest, Instant)>,
 ) {
-    if backend.is_none() {
-        *backend = try_connect(backend_addr).await;
-    }
-
-    if backend.is_none() {
-        let _ = req
-            .response_tx
-            .send(Err("backend unavailable".to_string()))
-            .await;
-        return;
-    }
-
-    let result = match exchange(&req.msg, backend.as_mut().expect("backend exists"), timeout, clients).await {
-        Ok(response) => Ok(response),
-        Err(reason) => {
-            warn!("backend error ({reason}) while handling {}, reconnecting", req.peer);
-            *backend = try_connect(backend_addr).await;
-            if let Some(conn) = backend.as_mut() {
-                exchange(&req.msg, conn, timeout, clients).await
-            } else {
-                Err("backend unavailable".to_string())
+    if let Some(conn) = backend.as_mut() {
+        match conn.writer.write_all(&req.msg).await {
+            Ok(()) => {
+                debug!(
+                    "[{} → backend] {}",
+                    req.peer,
+                    String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
+                );
+                *in_flight = Some((req, Instant::now() + timeout));
+                return;
+            }
+            Err(e) => {
+                warn!("backend write error ({e}) while handling {}, reconnecting", req.peer);
+                *backend = None;
             }
         }
-    };
-
-    if result.is_err() {
-        *backend = None;
     }
 
-    let _ = req.response_tx.send(result).await;
+    *backend = try_connect(backend_addr, spawner, backoff).await;
+    let Some(conn) = backend.as_mut() else {
+        let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
+        return;
+    };
+
+    match conn.writer.write_all(&req.msg).await {
+        Ok(()) => {
+            debug!(
+                "[{} → backend] {}",
+                req.peer,
+                String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
+            );
+            *in_flight = Some((req, Instant::now() + timeout));
+        }
+        Err(e) => {
+            *backend = None;
+            let _ = req
+                .response_tx
+                .send(Err(format!("backend write error: {e}")))
+                .await;
+        }
+    }
 }
 
 async fn handle_client(
@@ -262,25 +395,29 @@ async fn handle_client(
     clients: Clients,
     spawner: Arc<Executor<'static>>,
 ) {
-    let peer = stream.peer_addr().ok().map(|a| a.to_string());
-    let peer_str = peer.as_deref().unwrap_or("?").to_string();
+    let peer: Arc<str> = stream
+        .peer_addr()
+        .ok()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "?".to_string())
+        .into();
     let _ = stream.set_nodelay(true);
 
     let writer_stream = stream.clone();
     let mut client = BufReader::with_capacity(256, stream);
 
-    let (out_tx, out_rx) = channel::bounded::<Vec<u8>>(256);
+    let (out_tx, out_rx) = channel::bounded::<Arc<[u8]>>(CLIENT_OUT_CAP);
     {
-        let mut guard = clients.lock().await;
+        let mut guard = clients.lock().expect("clients mutex poisoned");
         guard.insert(client_id, out_tx.clone());
     }
 
-    let writer_peer = peer_str.clone();
+    let writer_peer = Arc::clone(&peer);
     spawner
         .spawn(async move {
             let mut writer = writer_stream;
-            while let Ok(line) = out_rx.recv().await {
-                if writer.write_all(&line).await.is_err() {
+            while let Ok(payload) = out_rx.recv().await {
+                if writer.write_all(&payload).await.is_err() {
                     break;
                 }
             }
@@ -293,44 +430,40 @@ async fn handle_client(
     loop {
         msg.clear();
 
-        // Read a \r-terminated message from the client.
         match client.read_until(b'\r', &mut msg).await {
-            Ok(0) | Err(_) => break, // client disconnected or unrecoverable error
-            Ok(_) => {
-                debug!(
-                    "[{peer_str} → backend] {}",
-                    String::from_utf8_lossy(&msg).trim_end_matches('\r')
-                );
-            }
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
 
         let (response_tx, response_rx) = channel::bounded(1);
         let req = BackendRequest {
-            peer: peer_str.clone(),
-            msg: msg.clone(),
+            peer: Arc::clone(&peer),
+            msg: std::mem::take(&mut msg),
             response_tx,
         };
+        msg = Vec::with_capacity(256);
 
         if request_tx.send(req).await.is_err() {
-            let _ = out_tx.send(b"ERROR: backend worker unavailable\r".to_vec()).await;
+            let _ = out_tx
+                .send(Arc::from(b"ERROR: backend worker unavailable\r".as_slice()))
+                .await;
             break;
         }
 
-        let result = response_rx.recv().await.unwrap_or_else(|_| Err("backend worker unavailable".to_string()));
+        let result = response_rx
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err("backend worker unavailable".to_string()));
 
         match result {
             Ok(response) => {
-                debug!(
-                    "[backend → {peer_str}] {}",
-                    String::from_utf8_lossy(&response).trim_end_matches('\r')
-                );
-                if out_tx.send(response).await.is_err() {
+                if out_tx.send(Arc::from(response)).await.is_err() {
                     break;
                 }
             }
             Err(reason) => {
                 let err = format!("ERROR: {reason}\r");
-                if out_tx.send(err.into_bytes()).await.is_err() {
+                if out_tx.send(Arc::from(err.into_bytes())).await.is_err() {
                     break;
                 }
             }
@@ -338,107 +471,33 @@ async fn handle_client(
     }
 
     {
-        let mut guard = clients.lock().await;
+        let mut guard = clients.lock().expect("clients mutex poisoned");
         guard.remove(&client_id);
     }
     drop(out_tx);
 
-    info!("client {peer_str} disconnected");
-}
-
-/// Writes `msg` verbatim to the backend, then reads until a non-update `\r`-terminated line is found.
-/// Matching update lines are broadcasted to all clients while waiting for the response.
-async fn exchange(
-    msg: &[u8],
-    conn: &mut BufReader<TcpStream>,
-    timeout: Duration,
-    clients: &Clients,
-) -> Result<Vec<u8>, String> {
-    conn.get_mut()
-        .write_all(msg)
-        .await
-        .map_err(|e| format!("backend write error: {e}"))?;
-
-    let deadline = Instant::now() + timeout;
-    let mut response = Vec::with_capacity(256);
-
-    loop {
-        response.clear();
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(format!("backend response timed out ({} s)", timeout.as_secs()));
-        }
-
-        match read_backend_line(conn, &mut response, remaining).await? {
-            ReadLineOutcome::TimedOut => {
-                return Err(format!("backend response timed out ({} s)", timeout.as_secs()));
-            }
-            ReadLineOutcome::Line => {
-                if is_backend_update(&response) {
-                    broadcast_update(clients, &response).await;
-                    continue;
-                }
-                return Ok(response.clone());
-            }
-        }
-    }
-}
-
-async fn read_backend_line(
-    conn: &mut BufReader<TcpStream>,
-    response: &mut Vec<u8>,
-    timeout: Duration,
-) -> Result<ReadLineOutcome, String> {
-    let read_fut = async {
-        match conn.read_until(b'\r', response).await {
-            Ok(0) => Err("backend closed connection".to_string()),
-            Ok(_) => Ok(ReadLineOutcome::Line),
-            Err(e) => Err(format!("backend read error: {e}")),
-        }
-    };
-
-    let timeout_fut = async {
-        Timer::after(timeout).await;
-        Ok(ReadLineOutcome::TimedOut)
-    };
-
-    future::or(read_fut, timeout_fut).await
+    info!("client {peer} disconnected");
 }
 
 fn is_backend_update(line: &[u8]) -> bool {
     UPDATE_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
 }
 
-async fn broadcast_update(clients: &Clients, line: &[u8]) {
-    let recipients = {
-        let guard = clients.lock().await;
-        guard
-            .iter()
-            .map(|(id, tx)| (*id, tx.clone()))
-            .collect::<Vec<_>>()
-    };
-
-    if recipients.is_empty() {
-        return;
-    }
-
-    let mut stale_clients = Vec::new();
-    for (id, tx) in recipients {
-        debug!(
-            "[backend → client {id}] {}",
-            String::from_utf8_lossy(line).trim_end_matches('\r')
-        );
-        match tx.try_send(line.to_vec()) {
-            Ok(()) => {}
-            Err(TrySendError::Closed(_)) | Err(TrySendError::Full(_)) => stale_clients.push(id),
+fn broadcast_update(clients: &Clients, line: &[u8]) {
+    let shared: Arc<[u8]> = Arc::from(line);
+    let mut guard = clients.lock().expect("clients mutex poisoned");
+    guard.retain(|id, tx| match tx.try_send(Arc::clone(&shared)) {
+        Ok(()) => {
+            debug!(
+                "[backend → client {id}] {}",
+                String::from_utf8_lossy(&shared).trim_end_matches('\r')
+            );
+            true
         }
-    }
-
-    if !stale_clients.is_empty() {
-        let mut guard = clients.lock().await;
-        for id in stale_clients {
-            guard.remove(&id);
+        Err(TrySendError::Closed(_)) => false,
+        Err(TrySendError::Full(_)) => {
+            warn!("client {id} send buffer full, dropping update");
+            true
         }
-    }
+    });
 }
