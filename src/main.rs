@@ -259,13 +259,37 @@ async fn backend_broker(
         let event = match (backend.as_ref(), in_flight.as_ref()) {
             (Some(conn), Some((_, deadline))) => {
                 if Instant::now() >= *deadline {
-                    match conn.events.try_recv() {
-                        Ok(ev) => BrokerEvent::Backend(ev),
-                        Err(channel::TryRecvError::Empty) => BrokerEvent::Timeout,
-                        Err(channel::TryRecvError::Closed) => BrokerEvent::Backend(
-                            BackendEvent::Error("backend reader ended".to_string()),
-                        ),
+                    // Drain pending events before declaring a timeout:
+                    //   - broadcast any update lines so they aren't lost,
+                    //   - if a response is queued, use it — handles
+                    //     the race where the response landed just before the deadline,
+                    //   - otherwise emit Timeout. Bounded by BACKEND_EVENT_CAP, so this
+                    //     cannot spin past the deadline indefinitely.
+                    let mut result = BrokerEvent::Timeout;
+                    loop {
+                        match conn.events.try_recv() {
+                            Ok(BackendEvent::Line(line)) => {
+                                if is_backend_update(&line) {
+                                    broadcast_update(&clients, &line);
+                                    continue;
+                                }
+                                result = BrokerEvent::Backend(BackendEvent::Line(line));
+                                break;
+                            }
+                            Ok(BackendEvent::Error(reason)) => {
+                                result = BrokerEvent::Backend(BackendEvent::Error(reason));
+                                break;
+                            }
+                            Err(channel::TryRecvError::Empty) => break,
+                            Err(channel::TryRecvError::Closed) => {
+                                result = BrokerEvent::Backend(BackendEvent::Error(
+                                    "backend reader ended".to_string(),
+                                ));
+                                break;
+                            }
+                        }
                     }
+                    result
                 } else {
                     let backend_fut = async {
                         match conn.events.recv().await {
@@ -542,8 +566,10 @@ fn broadcast_update(clients: &Clients, line: &[u8]) {
         }
         Err(TrySendError::Closed(_)) => false,
         Err(TrySendError::Full(_)) => {
-            warn!("client {id} send buffer full, dropping update");
-            true
+            // At ~1 Hz sustained events, a full 256-deep buffer means the client
+            // hasn't drained anything in ~4 minutes. Client is dead.
+            warn!("client {id} send buffer full, dropping client");
+            false
         }
     });
 }
