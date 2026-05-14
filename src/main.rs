@@ -230,7 +230,12 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                 return;
             }
             Ok(_) => {
-                if tx.send(BackendEvent::Line(std::mem::take(&mut buf))).await.is_err() {
+                // Hand the filled buffer off and pre-allocate a fresh one in its
+                // place. capacity().max(256) preserves the high-water mark so a
+                // previously-grown buffer doesn't shrink back to the default.
+                let next_capacity = buf.capacity().max(256);
+                let line = std::mem::replace(&mut buf, Vec::with_capacity(next_capacity));
+                if tx.send(BackendEvent::Line(line)).await.is_err() {
                     return;
                 }
             }
@@ -397,6 +402,36 @@ async fn backend_broker(
     }
 }
 
+/// Handles one request against the backend.
+///
+/// Failure / retry policy (intentional; do not change without re-reading this):
+///
+/// 1. If we have a live `backend` connection, attempt the write. On success the
+///    request becomes the in-flight request and we wait for the response on
+///    the broker's main loop.
+///
+/// 2. If that write fails, we have just lost a previously-working connection.
+///    We bump backoff (so future requests get throttled) AND set
+///    `retry_after_write_fail = true` so this single request bypasses the
+///    `is_ready()` gate below for one reconnect-and-retry attempt. This is
+///    the "transient network blip" recovery path: when the player power-
+///    cycles or a Wi-Fi packet is lost, the user's first command after the
+///    blip should still succeed instead of surfacing an error.
+///
+///    The bypass is **bounded**: it can only fire when `backend.is_some()`,
+///    which is true at most once per healthy→broken transition. After
+///    `*backend = None`, every subsequent request takes the no-outer-write
+///    path and is gated by `is_ready()`. So a misbehaving backend (accepts
+///    connections then immediately rejects writes) produces at most one
+///    connect+write attempt per backoff window — i.e. throttled, not a storm.
+///
+/// 3. If there is no backend connection at all (first request after broker
+///    start, or after a previous failure), we respect `is_ready()`. During
+///    the backoff cooldown we fast-fail with `"backend unavailable"` instead
+///    of hammering the player with connect attempts.
+///
+/// 4. After `try_connect`, the inner write may also fail. Bump backoff again
+///    so the next request is gated; surface the error to the client.
 async fn handle_new_request(
     req: BackendRequest,
     backend: &mut Option<BackendConn>,
@@ -406,6 +441,10 @@ async fn handle_new_request(
     timeout: Duration,
     in_flight: &mut Option<(BackendRequest, Instant)>,
 ) {
+    // See the function doc for why this exists. TL;DR: write-error retry is
+    // bounded to one attempt per healthy→broken transition; later requests
+    // are gated by `is_ready()` because `backend` is None and the outer
+    // branch is skipped.
     let mut retry_after_write_fail = false;
 
     if let Some(conn) = backend.as_mut() {
@@ -428,6 +467,9 @@ async fn handle_new_request(
         }
     }
 
+    // Path A (`!retry_after_write_fail`): no backend at entry; obey the cooldown.
+    // Path B (`retry_after_write_fail`): we just bumped backoff after losing a
+    // live connection — bypass the gate this one time for the retry.
     if !retry_after_write_fail && !backoff.is_ready() {
         let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
         return;
@@ -507,9 +549,12 @@ async fn handle_client(
         }
 
         let (response_tx, response_rx) = channel::bounded(1);
+        // Same pattern as backend_reader: hand the buffer off and pre-allocate a
+        // fresh one so the next read_until has no growth churn.
+        let next_capacity = msg.capacity().max(256);
         let req = BackendRequest {
             peer: Arc::clone(&peer),
-            msg: std::mem::take(&mut msg),
+            msg: std::mem::replace(&mut msg, Vec::with_capacity(next_capacity)),
             response_tx,
         };
 
