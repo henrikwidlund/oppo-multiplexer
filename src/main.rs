@@ -259,7 +259,13 @@ async fn backend_broker(
         let event = match (backend.as_ref(), in_flight.as_ref()) {
             (Some(conn), Some((_, deadline))) => {
                 if Instant::now() >= *deadline {
-                    BrokerEvent::Timeout
+                    match conn.events.try_recv() {
+                        Ok(ev) => BrokerEvent::Backend(ev),
+                        Err(channel::TryRecvError::Empty) => BrokerEvent::Timeout,
+                        Err(channel::TryRecvError::Closed) => BrokerEvent::Backend(
+                            BackendEvent::Error("backend reader ended".to_string()),
+                        ),
+                    }
                 } else {
                     let backend_fut = async {
                         match conn.events.recv().await {
@@ -376,6 +382,8 @@ async fn handle_new_request(
     timeout: Duration,
     in_flight: &mut Option<(BackendRequest, Instant)>,
 ) {
+    let mut retry_after_write_fail = false;
+
     if let Some(conn) = backend.as_mut() {
         match conn.writer.write_all(&req.msg).await {
             Ok(()) => {
@@ -390,11 +398,13 @@ async fn handle_new_request(
             Err(e) => {
                 warn!("backend write error ({e}) while handling {}, reconnecting", req.peer);
                 *backend = None;
+                backoff.on_failure();
+                retry_after_write_fail = true;
             }
         }
     }
 
-    if !backoff.is_ready() {
+    if !retry_after_write_fail && !backoff.is_ready() {
         let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
         return;
     }
