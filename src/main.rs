@@ -8,7 +8,7 @@ use smol::{
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
@@ -30,6 +30,7 @@ const UPDATE_PREFIXES: [&[u8]; 11] = [
 const REQUEST_CHANNEL_CAP: usize = 32;
 const CLIENT_OUT_CAP: usize = 256;
 const BACKEND_EVENT_CAP: usize = 32;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct Backoff {
     current: Duration,
@@ -57,6 +58,10 @@ impl Backoff {
 }
 
 type Clients = Arc<Mutex<HashMap<u64, Sender<Arc<[u8]>>>>>;
+
+fn lock_clients(clients: &Clients) -> MutexGuard<'_, HashMap<u64, Sender<Arc<[u8]>>>> {
+    clients.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct BackendRequest {
     peer: Arc<str>,
@@ -170,7 +175,16 @@ async fn try_connect(
     spawner: &Arc<Executor<'static>>,
     backoff: &mut Backoff,
 ) -> Option<BackendConn> {
-    match TcpStream::connect(addr).await {
+    let result = future::or(
+        async { TcpStream::connect(addr).await.map_err(|e| e.to_string()) },
+        async {
+            Timer::after(CONNECT_TIMEOUT).await;
+            Err(format!("connect timed out after {}s", CONNECT_TIMEOUT.as_secs()))
+        },
+    )
+    .await;
+
+    match result {
         Ok(stream) => {
             // Disable Nagle's algorithm — we send small commands and need low latency.
             let _ = stream.set_nodelay(true);
@@ -233,20 +247,24 @@ async fn backend_broker(
     loop {
         let event = match (backend.as_ref(), in_flight.as_ref()) {
             (Some(conn), Some((_, deadline))) => {
-                let backend_fut = async {
-                    match conn.events.recv().await {
-                        Ok(ev) => BrokerEvent::Backend(ev),
-                        Err(_) => BrokerEvent::Backend(BackendEvent::Error(
-                            "backend reader ended".to_string(),
-                        )),
-                    }
-                };
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let timeout_fut = async move {
-                    Timer::after(remaining).await;
+                if Instant::now() >= *deadline {
                     BrokerEvent::Timeout
-                };
-                future::or(backend_fut, timeout_fut).await
+                } else {
+                    let backend_fut = async {
+                        match conn.events.recv().await {
+                            Ok(ev) => BrokerEvent::Backend(ev),
+                            Err(_) => BrokerEvent::Backend(BackendEvent::Error(
+                                "backend reader ended".to_string(),
+                            )),
+                        }
+                    };
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let timeout_fut = async move {
+                        Timer::after(remaining).await;
+                        BrokerEvent::Timeout
+                    };
+                    future::or(backend_fut, timeout_fut).await
+                }
             }
             (Some(conn), None) => {
                 let backend_fut = async {
@@ -314,6 +332,7 @@ async fn backend_broker(
             BrokerEvent::Backend(BackendEvent::Error(reason)) => {
                 warn!("{reason}");
                 backend = None;
+                backoff.on_failure();
                 if let Some((req, _)) = in_flight.take() {
                     let _ = req.response_tx.send(Err(reason)).await;
                 }
@@ -324,6 +343,7 @@ async fn backend_broker(
                     let _ = req.response_tx.send(Err(reason)).await;
                     // Drop backend: protocol state may be desynced after a missed response.
                     backend = None;
+                    backoff.on_failure();
                 }
             }
             BrokerEvent::ReconnectTick => {
@@ -408,7 +428,7 @@ async fn handle_client(
 
     let (out_tx, out_rx) = channel::bounded::<Arc<[u8]>>(CLIENT_OUT_CAP);
     {
-        let mut guard = clients.lock().expect("clients mutex poisoned");
+        let mut guard = lock_clients(&clients);
         guard.insert(client_id, out_tx.clone());
     }
 
@@ -471,7 +491,7 @@ async fn handle_client(
     }
 
     {
-        let mut guard = clients.lock().expect("clients mutex poisoned");
+        let mut guard = lock_clients(&clients);
         guard.remove(&client_id);
     }
     drop(out_tx);
@@ -485,7 +505,7 @@ fn is_backend_update(line: &[u8]) -> bool {
 
 fn broadcast_update(clients: &Clients, line: &[u8]) {
     let shared: Arc<[u8]> = Arc::from(line);
-    let mut guard = clients.lock().expect("clients mutex poisoned");
+    let mut guard = lock_clients(clients);
     guard.retain(|id, tx| match tx.try_send(Arc::clone(&shared)) {
         Ok(()) => {
             debug!(
