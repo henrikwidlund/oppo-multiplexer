@@ -611,7 +611,7 @@ async fn handle_client(
     // Three TcpStream clones share the same underlying socket: one for the
     // writer task, one stored in the clients map so broadcast can force a
     // shutdown if the client falls fatally behind, one consumed by BufReader.
-    let writer_stream = stream.clone();
+    let mut writer_stream = stream.clone();
     let map_stream = stream.clone();
     let mut client = BufReader::with_capacity(256, stream);
 
@@ -624,9 +624,8 @@ async fn handle_client(
     let writer_peer = Arc::clone(&peer);
     spawner
         .spawn(async move {
-            let mut writer = writer_stream;
             while let Ok(payload) = out_rx.recv().await {
-                if writer.write_all(&payload).await.is_err() {
+                if writer_stream.write_all(&payload).await.is_err() {
                     break;
                 }
             }
@@ -639,12 +638,12 @@ async fn handle_client(
     loop {
         msg.clear();
 
-        match client.read_until(b'\r', &mut msg).await {
-            Ok(0) | Err(_) => break,
-            // EOF mid-line: forwarding a truncated command to the player could
-            // make it execute something partial. Treat as a disconnect.
-            Ok(_) if msg.last() != Some(&b'\r') => break,
-            Ok(_) => {}
+        // Disconnect on read error or any line not terminated by `\r` (clean
+        // EOF and EOF mid-line both leave the buffer without the terminator).
+        // Forwarding a truncated command could make the player execute a
+        // partial command.
+        if client.read_until(b'\r', &mut msg).await.is_err() || msg.last() != Some(&b'\r') {
+            break;
         }
 
         let (response_tx, response_rx) = channel::bounded(1);
@@ -667,18 +666,12 @@ async fn handle_client(
             .await
             .expect("broker fires response_tx on every code path");
 
-        match result {
-            Ok(response) => {
-                if out_tx.send(Arc::from(response)).await.is_err() {
-                    break;
-                }
-            }
-            Err(reason) => {
-                let err = format!("ERROR: {reason}\r");
-                if out_tx.send(Arc::from(err.into_bytes())).await.is_err() {
-                    break;
-                }
-            }
+        let payload: Arc<[u8]> = match result {
+            Ok(response) => Arc::from(response),
+            Err(reason) => Arc::from(format!("ERROR: {reason}\r").into_bytes()),
+        };
+        if out_tx.send(payload).await.is_err() {
+            break;
         }
     }
 
