@@ -32,6 +32,13 @@ const CLIENT_OUT_CAP: usize = 256;
 const BACKEND_EVENT_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Linear backoff for backend reconnect attempts. Tracks both the current
+/// wait duration and the absolute time of the next allowed attempt. Both the
+/// scheduled (ReconnectTick) path and the on-demand (handle_new_request) path
+/// consult this single source of truth so they cannot race past each other.
+///
+/// Sequence on repeated failures: 0.5s, 1.0s, 1.5s, ... capped at 15s.
+/// Resets to zero on any successful connect.
 struct Backoff {
     current: Duration,
     next_attempt_at: Instant,
@@ -48,10 +55,12 @@ impl Backoff {
         }
     }
 
+    /// True if a connect attempt is allowed right now.
     fn is_ready(&self) -> bool {
         Instant::now() >= self.next_attempt_at
     }
 
+    /// Duration until the next attempt is allowed; zero if already allowed.
     fn delay_until_ready(&self) -> Duration {
         self.next_attempt_at.saturating_duration_since(Instant::now())
     }
@@ -74,36 +83,54 @@ impl Backoff {
 type ClientEntry = (Sender<Arc<[u8]>>, TcpStream);
 type Clients = Arc<Mutex<HashMap<u64, ClientEntry>>>;
 
+/// Locks the clients map, recovering from poison so a panicking client task
+/// cannot bring down the whole server.
 fn lock_clients(clients: &Clients) -> MutexGuard<'_, HashMap<u64, ClientEntry>> {
     clients.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A client command waiting for its backend response. `response_tx` is a
+/// per-request one-shot (bounded(1)) populated by the broker.
 struct BackendRequest {
     peer: Arc<str>,
     msg: Vec<u8>,
     response_tx: Sender<Result<Vec<u8>, String>>,
 }
 
+/// An event read from the backend by the dedicated reader task.
 enum BackendEvent {
+    /// A `\r`-terminated protocol line — either an unsolicited update or the
+    /// response to the current in-flight request.
     Line(Vec<u8>),
+    /// The backend connection is no longer usable (EOF, read error, or
+    /// truncated mid-line). The broker drops the connection on receipt.
     Error(String),
 }
 
+/// A live backend connection plus the channel its reader task feeds into.
+/// Dropping this value drops the held `Task`, which cancels the reader at its
+/// next await point and closes the socket.
 struct BackendConn {
     writer: TcpStream,
     events: Receiver<BackendEvent>,
+    /// Owned to bind the reader task's lifetime to this connection.
+    /// `smol::Task::drop` cancels the task.
     _reader_task: smol::Task<()>,
 }
 
+/// Things the broker's main `select` can produce on a single tick.
 enum BrokerEvent {
     Request(BackendRequest),
     Backend(BackendEvent),
+    /// The in-flight request's deadline has passed.
     Timeout,
+    /// The backoff window has elapsed; try to reconnect.
     ReconnectTick,
-    RequestsClosed,
 }
 
 #[cfg(target_os = "linux")]
+/// Sets up tracing via journald.
+/// Level is controlled by `RUST_LOG`, defaulting to `info`.
 fn init_logging() {
     use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
@@ -117,6 +144,8 @@ fn init_logging() {
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Sets up tracing via stdout/stderr.
+/// Level is controlled by `RUST_LOG`, defaulting to `info`.
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
@@ -185,6 +214,10 @@ fn main() {
 
 // ---------- helpers ----------
 
+/// Attempt one TCP connect to the backend, capped by `CONNECT_TIMEOUT` so a
+/// silent-drop player cannot hang the broker for the OS-default minutes.
+/// Records the outcome on `backoff`. On success, spawns the reader task and
+/// returns a live `BackendConn`.
 async fn try_connect(
     addr: &str,
     spawner: &Arc<Executor<'static>>,
@@ -222,6 +255,17 @@ async fn try_connect(
     }
 }
 
+/// Reads `\r`-terminated lines from the backend socket forever and pushes them
+/// to the broker through `tx`. Runs as its own task so the broker's `select`
+/// loop can never interrupt a partially-read line.
+///
+/// Update lines are sent non-blocking (`try_send`): under sustained event flow
+/// they are fire-and-forget, and blocking here would propagate backpressure
+/// into the player's TCP send window. Responses and protocol errors use the
+/// awaiting `send` since they must not be silently dropped — there is only
+/// ever one in-flight response at a time, so this path rarely fills.
+///
+/// Exits on EOF, read error, truncated mid-line, or once `tx` is closed.
 async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     let mut reader = BufReader::with_capacity(256, stream);
     let mut buf = Vec::with_capacity(256);
@@ -279,6 +323,10 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     }
 }
 
+/// Waits for the next event from the backend reader task. If the reader has
+/// already exited (channel closed), returns a manufactured `BackendEvent::Error`
+/// so the broker's existing "backend died" handling runs — no extra match arm
+/// needed for the channel-closed case.
 async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
     match events.recv().await {
         Ok(ev) => BrokerEvent::Backend(ev),
@@ -288,13 +336,29 @@ async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
     }
 }
 
+/// Waits for the next client request. `main` holds the original `request_tx`
+/// for the whole program lifetime, so `recv` cannot return `Err` here.
 async fn recv_request(requests: &Receiver<BackendRequest>) -> BrokerEvent {
-    match requests.recv().await {
-        Ok(req) => BrokerEvent::Request(req),
-        Err(_) => BrokerEvent::RequestsClosed,
-    }
+    let req = requests
+        .recv()
+        .await
+        .expect("main holds the original request_tx");
+    BrokerEvent::Request(req)
 }
 
+/// Single-owner state machine for the backend connection. Only one request is
+/// in-flight at a time, matching the player's single-TCP-connection constraint.
+///
+/// Each loop iteration selects from one of three modes based on
+/// (backend, in_flight) state:
+/// - `(Some, Some)`: waiting for a response or timeout; queued updates broadcast
+///   inline. A pre-deadline drain prevents a just-arrived response from being
+///   discarded when the timer fires.
+/// - `(Some, None)`: idle with a live connection; biased toward new requests so
+///   commands are not delayed by a flood of unsolicited update events.
+/// - `(None, _)`: no connection; either pull a new request (which may try to
+///   reconnect inline) or fire a scheduled `ReconnectTick` when the backoff
+///   window elapses.
 async fn backend_broker(
     request_rx: Receiver<BackendRequest>,
     clients: Clients,
@@ -417,7 +481,6 @@ async fn backend_broker(
                     backend = try_connect(&backend_addr, &spawner, &mut backoff).await;
                 }
             }
-            BrokerEvent::RequestsClosed => break,
         }
     }
 }
@@ -521,6 +584,13 @@ async fn handle_new_request(
     }
 }
 
+/// One task per accepted client. Reads `\r`-terminated commands from the
+/// socket, forwards each to the broker, and writes the response back.
+///
+/// A dedicated writer task (spawned here) drains the per-client out-channel
+/// in parallel. Both the writer and the broadcast path share the same channel,
+/// so the client receives a serialized mix of its own command responses and
+/// unsolicited backend updates (events).
 async fn handle_client(
     stream: TcpStream,
     client_id: u64,
@@ -621,10 +691,16 @@ async fn handle_client(
     info!("client {peer} disconnected");
 }
 
+/// True if `line` is one of the player's unsolicited status updates (any of
+/// the `@U??` prefixes), as opposed to a response to an issued command.
 fn is_backend_update(line: &[u8]) -> bool {
     UPDATE_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
 }
 
+/// Fans out an update line to every registered client via non-blocking
+/// `try_send`. Clients whose channel is closed are removed; clients whose
+/// channel is full are force-disconnected via TCP shutdown so their tasks
+/// tear down promptly instead of lingering on a broken socket.
 fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
     // Accept owned data so callers can hand off a Vec<u8> for a zero-copy
     // conversion into Arc<[u8]>. Borrowed slices still work via Arc::from(&[u8]).
