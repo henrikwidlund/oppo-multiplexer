@@ -279,6 +279,22 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     }
 }
 
+async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
+    match events.recv().await {
+        Ok(ev) => BrokerEvent::Backend(ev),
+        Err(_) => BrokerEvent::Backend(BackendEvent::Error(
+            "backend reader ended".to_string(),
+        )),
+    }
+}
+
+async fn recv_request(requests: &Receiver<BackendRequest>) -> BrokerEvent {
+    match requests.recv().await {
+        Ok(req) => BrokerEvent::Request(req),
+        Err(_) => BrokerEvent::RequestsClosed,
+    }
+}
+
 async fn backend_broker(
     request_rx: Receiver<BackendRequest>,
     clients: Clients,
@@ -326,52 +342,26 @@ async fn backend_broker(
                     }
                     result
                 } else {
-                    let backend_fut = async {
-                        match conn.events.recv().await {
-                            Ok(ev) => BrokerEvent::Backend(ev),
-                            Err(_) => BrokerEvent::Backend(BackendEvent::Error(
-                                "backend reader ended".to_string(),
-                            )),
-                        }
-                    };
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     let timeout_fut = async move {
                         Timer::after(remaining).await;
                         BrokerEvent::Timeout
                     };
-                    future::or(backend_fut, timeout_fut).await
+                    future::or(recv_backend_event(&conn.events), timeout_fut).await
                 }
             }
             (Some(conn), None) => {
-                let backend_fut = async {
-                    match conn.events.recv().await {
-                        Ok(ev) => BrokerEvent::Backend(ev),
-                        Err(_) => BrokerEvent::Backend(BackendEvent::Error(
-                            "backend reader ended".to_string(),
-                        )),
-                    }
-                };
-                let request_fut = async {
-                    match request_rx.recv().await {
-                        Ok(req) => BrokerEvent::Request(req),
-                        Err(_) => BrokerEvent::RequestsClosed,
-                    }
-                };
-                future::or(request_fut, backend_fut).await
+                // Bias requests over backend events: requests are latency-sensitive
+                // (someone pressed a button), updates are passive state changes.
+                future::or(recv_request(&request_rx), recv_backend_event(&conn.events)).await
             }
             (None, _) => {
-                let request_fut = async {
-                    match request_rx.recv().await {
-                        Ok(req) => BrokerEvent::Request(req),
-                        Err(_) => BrokerEvent::RequestsClosed,
-                    }
-                };
                 let delay = backoff.delay_until_ready();
                 let reconnect_fut = async move {
                     Timer::after(delay).await;
                     BrokerEvent::ReconnectTick
                 };
-                future::or(request_fut, reconnect_fut).await
+                future::or(recv_request(&request_rx), reconnect_fut).await
             }
         };
 
