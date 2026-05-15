@@ -735,3 +735,100 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STEP: Duration = Duration::from_millis(500);
+    const MAX: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn backoff_starts_ready() {
+        let bo = Backoff::new();
+        assert!(bo.is_ready());
+        assert_eq!(bo.delay_until_ready(), Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_grows_by_step_per_failure() {
+        let mut bo = Backoff::new();
+        for i in 1..=5 {
+            bo.on_failure();
+            let expected = STEP * i;
+            let delay = bo.delay_until_ready();
+            assert!(
+                delay <= expected,
+                "iter {i}: delay {delay:?} should be <= {expected:?}"
+            );
+            let lower = expected.saturating_sub(Duration::from_millis(50));
+            assert!(
+                delay >= lower,
+                "iter {i}: delay {delay:?} should be ~{expected:?} (>= {lower:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_capped_at_max() {
+        let mut bo = Backoff::new();
+        for _ in 0..100 {
+            bo.on_failure();
+        }
+        let delay = bo.delay_until_ready();
+        assert!(delay <= MAX, "delay {delay:?} exceeded MAX {MAX:?}");
+        let lower = MAX.saturating_sub(Duration::from_millis(50));
+        assert!(delay >= lower, "delay {delay:?} not near MAX {MAX:?}");
+    }
+
+    #[test]
+    fn backoff_resets_on_success() {
+        let mut bo = Backoff::new();
+        bo.on_failure();
+        bo.on_failure();
+        bo.on_failure();
+        bo.on_success();
+        assert!(bo.is_ready());
+        assert_eq!(bo.delay_until_ready(), Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_not_ready_immediately_after_failure() {
+        let mut bo = Backoff::new();
+        bo.on_failure();
+        assert!(!bo.is_ready());
+    }
+
+    #[test]
+    fn is_backend_update_matches_all_prefixes() {
+        for prefix in UPDATE_PREFIXES {
+            let mut line = prefix.to_vec();
+            line.extend_from_slice(b"data\r");
+            assert!(
+                is_backend_update(&line),
+                "{:?} should be an update",
+                String::from_utf8_lossy(prefix),
+            );
+        }
+    }
+
+    #[test]
+    fn is_backend_update_rejects_non_updates() {
+        let cases: &[&[u8]] = &[
+            b"@OK\r",
+            b"@ERR INVALID\r",
+            b"\r",
+            b"",
+            b"@U",
+            b"@UPW",
+            b"prefix @UTC mid\r",
+        ];
+        for line in cases {
+            assert!(
+                !is_backend_update(line),
+                "{:?} should NOT be an update",
+                String::from_utf8_lossy(line),
+            );
+        }
+    }
+}
