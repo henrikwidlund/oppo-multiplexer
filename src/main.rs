@@ -163,7 +163,10 @@ fn main() {
     }
     let listen_port = args[1].clone();
     let backend_addr: Arc<str> = args[2].as_str().into();
-    let timeout = Duration::from_secs(args[3].parse::<u64>().unwrap());
+    let timeout = Duration::from_secs(args[3].parse::<u64>().unwrap_or_else(|_| {
+        eprintln!("Invalid timeout_seconds: '{}' is not a non-negative integer", args[3]);
+        std::process::exit(1);
+    }));
 
     let ex = Arc::new(Executor::new());
     let spawner = Arc::clone(&ex);
@@ -172,22 +175,19 @@ fn main() {
         let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
         let (request_tx, request_rx) = channel::bounded::<BackendRequest>(REQUEST_CHANNEL_CAP);
 
-        let broker_clients = Arc::clone(&clients);
-        let broker_backend_addr = Arc::clone(&backend_addr);
-        let broker_spawner = Arc::clone(&spawner);
         spawner
             .spawn(backend_broker(
                 request_rx,
-                broker_clients,
-                broker_backend_addr,
+                Arc::clone(&clients),
+                Arc::clone(&backend_addr),
                 timeout,
-                broker_spawner,
+                Arc::clone(&spawner),
             ))
             .detach();
 
         let listener = TcpListener::bind(format!("0.0.0.0:{listen_port}"))
             .await
-            .unwrap_or_else(|e| panic!("Failed to bind to 0.0.0.0:{listen_port}: {e}"));
+            .expect("failed to bind listen port");
         info!("listening on 0.0.0.0:{listen_port}, backend {backend_addr}");
 
         let mut next_client_id = 1_u64;
@@ -198,12 +198,14 @@ fn main() {
                     info!("client {addr} connected");
                     let client_id = next_client_id;
                     next_client_id = next_client_id.wrapping_add(1);
-                    let requests = request_tx.clone();
-                    let clients = Arc::clone(&clients);
-                    let task_spawner = Arc::clone(&spawner);
-                    let writer_spawner = Arc::clone(&spawner);
-                    task_spawner
-                        .spawn(handle_client(stream, client_id, requests, clients, writer_spawner))
+                    spawner
+                        .spawn(handle_client(
+                            stream,
+                            client_id,
+                            request_tx.clone(),
+                            Arc::clone(&clients),
+                            Arc::clone(&spawner),
+                        ))
                         .detach();
                 }
                 Err(e) => error!("accept error: {e}"),
@@ -655,17 +657,15 @@ async fn handle_client(
             response_tx,
         };
 
-        if request_tx.send(req).await.is_err() {
-            let _ = out_tx
-                .send(Arc::from(b"ERROR: backend worker unavailable\r".as_slice()))
-                .await;
-            break;
-        }
+        request_tx
+            .send(req)
+            .await
+            .expect("broker holds request_rx for the program's lifetime");
 
         let result = response_rx
             .recv()
             .await
-            .unwrap_or_else(|_| Err("backend worker unavailable".to_string()));
+            .expect("broker fires response_tx on every code path");
 
         match result {
             Ok(response) => {
@@ -686,7 +686,6 @@ async fn handle_client(
         let mut guard = lock_clients(&clients);
         guard.remove(&client_id);
     }
-    drop(out_tx);
 
     info!("client {peer} disconnected");
 }
