@@ -205,7 +205,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 echo "Downloading ${URL}"
-curl -fL "${URL}" -o "${TMP_DIR}/${ASSET}"
+curl --proto "=https" --tlsv1.2 -sSf -fL "${URL}" -o "${TMP_DIR}/${ASSET}"
 tar -xzf "${TMP_DIR}/${ASSET}" -C "${TMP_DIR}"
 
 if [[ ! -f "${TMP_DIR}/oppo-multiplexer" ]]; then
