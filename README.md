@@ -28,6 +28,13 @@ Example:
 oppo-multiplexer 23 192.168.1.50:23 10
 ```
 
+### Installing on Linux
+
+Download `install_linux.sh` and follow the instructions. If you want to run on ports below 1024,
+you will need to run as root.
+You can use the `CAP_NET_BIND_SERVICE` capability to avoid root on ports below 1024,
+but the script does not take this into consideration.
+
 ### Logging
 
 Log level is controlled via the `RUST_LOG` environment variable. Defaults to `info`. On Linux, logs are sent to journald.
