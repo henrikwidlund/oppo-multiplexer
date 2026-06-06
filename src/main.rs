@@ -496,7 +496,7 @@ async fn backend_broker(
                     let _ = req.response_tx.send(Ok(line)).await;
                 } else {
                     warn!(
-                        "orphan non-update backend line (no in-flight request; possible late response after timeout): {}",
+                        "orphan non-update backend line (no in-flight request): {}",
                         String::from_utf8_lossy(&line).trim_end_matches('\r')
                     );
                 }
