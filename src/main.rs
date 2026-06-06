@@ -174,7 +174,7 @@ fn main() {
     let max_consecutive_timeouts = if args.len() == 5 {
         parse_max_consecutive_timeouts(&args[4]).unwrap_or_else(|| {
             eprintln!(
-                "Invalid max_consecutive_timeouts: '{}' must be an integer >= 1",
+                "Invalid max_consecutive_timeouts: '{}' must be an integer in the the range 1-100",
                 args[4]
             );
             std::process::exit(1);
