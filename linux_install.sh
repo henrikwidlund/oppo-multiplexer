@@ -217,7 +217,8 @@ WantedBy=multi-user.target
 EOUNIT
 
 systemctl daemon-reload
-systemctl enable --now oppo-multiplexer
+systemctl enable oppo-multiplexer
+systemctl restart oppo-multiplexer
 
 echo
 echo "Install complete."
