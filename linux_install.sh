@@ -107,6 +107,9 @@ read -r -p "Listen port for oppo-multiplexer: " LISTEN_PORT
 read -r -p "Timeout seconds (default 10): " TIMEOUT_SECONDS
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-10}"
 
+read -r -p "Max consecutive timed-out requests before reconnect (default 3): " MAX_CONSECUTIVE_TIMEOUTS
+MAX_CONSECUTIVE_TIMEOUTS="${MAX_CONSECUTIVE_TIMEOUTS:-3}"
+
 if ! [[ "${OPPO_PORT}" =~ ^[0-9]+$ ]] || (( OPPO_PORT < 1 || OPPO_PORT > 65535 )); then
   echo "Invalid Oppo port: ${OPPO_PORT}"
   exit 1
@@ -117,6 +120,10 @@ if ! [[ "${LISTEN_PORT}" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 6
 fi
 if ! [[ "${TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
   echo "Invalid timeout seconds: ${TIMEOUT_SECONDS}"
+  exit 1
+fi
+if ! [[ "${MAX_CONSECUTIVE_TIMEOUTS}" =~ ^[0-9]+$ ]] || (( MAX_CONSECUTIVE_TIMEOUTS < 1 )); then
+  echo "Invalid max consecutive timeouts: ${MAX_CONSECUTIVE_TIMEOUTS} (must be >= 1)"
   exit 1
 fi
 
@@ -170,6 +177,7 @@ OPPO_HOST=${OPPO_HOST}
 OPPO_PORT=${OPPO_PORT}
 LISTEN_PORT=${LISTEN_PORT}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS}
+MAX_CONSECUTIVE_TIMEOUTS=${MAX_CONSECUTIVE_TIMEOUTS}
 RUST_LOG=info
 EOCFG
 chown "root:${ENV_GROUP}" "${ENV_FILE}"
@@ -185,7 +193,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=${ENV_FILE}
-ExecStart=${BIN_PATH} \${LISTEN_PORT} \${OPPO_HOST}:\${OPPO_PORT} \${TIMEOUT_SECONDS}
+ExecStart=${BIN_PATH} \${LISTEN_PORT} \${OPPO_HOST}:\${OPPO_PORT} \${TIMEOUT_SECONDS} \${MAX_CONSECUTIVE_TIMEOUTS}
 Restart=always
 RestartSec=2
 TimeoutStopSec=5
