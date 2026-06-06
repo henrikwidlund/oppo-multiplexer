@@ -15,17 +15,18 @@ The binary will be at `target/release/oppo-multiplexer`.
 ## Run
 
 ```
-oppo-multiplexer <listen_port> <backend_host:backend_port> <timeout_seconds>
+oppo-multiplexer <listen_port> <backend_host:backend_port> <timeout_seconds> [max_consecutive_timeouts]
 ```
 
 - `listen_port` — port to accept incoming client connections on
 - `backend_host:backend_port` — address of the Oppo player
 - `timeout_seconds` — how long to wait for a response from the player before giving up
+- `max_consecutive_timeouts` — optional; reconnect backend only after this many consecutive timed-out requests (default: `3`, must be in the range `1-100`)
 
 Example:
 
-```
-oppo-multiplexer 23 192.168.1.50:23 10
+```shell
+oppo-multiplexer 23 192.168.1.50:23 10 5
 ```
 
 ### Installing on Linux

@@ -31,6 +31,7 @@ const REQUEST_CHANNEL_CAP: usize = 32;
 const CLIENT_OUT_CAP: usize = 256;
 const BACKEND_EVENT_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 
 /// Linear backoff for backend reconnect attempts. Tracks both the current
 /// wait duration and the absolute time of the next allowed attempt. Both the
@@ -157,8 +158,11 @@ fn main() {
     init_logging();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 4 {
-        eprintln!("Usage: {} <listen_port> <backend_host:backend_port> <timeout_seconds>", args[0]);
+    if !matches!(args.len(), 4 | 5) {
+        eprintln!(
+            "Usage: {} <listen_port> <backend_host:backend_port> <timeout_seconds> [max_consecutive_timeouts]",
+            args[0]
+        );
         std::process::exit(1);
     }
     let listen_port = args[1].clone();
@@ -167,6 +171,17 @@ fn main() {
         eprintln!("Invalid timeout_seconds: '{}' is not a non-negative integer", args[3]);
         std::process::exit(1);
     }));
+    let max_consecutive_timeouts = if args.len() == 5 {
+        parse_max_consecutive_timeouts(&args[4]).unwrap_or_else(|| {
+            eprintln!(
+                "Invalid max_consecutive_timeouts: '{}' must be an integer in the range 1-100",
+                args[4]
+            );
+            std::process::exit(1);
+        })
+    } else {
+        DEFAULT_MAX_CONSECUTIVE_TIMEOUTS
+    };
 
     let ex = Arc::new(Executor::new());
     let spawner = Arc::clone(&ex);
@@ -181,6 +196,7 @@ fn main() {
                 Arc::clone(&clients),
                 Arc::clone(&backend_addr),
                 timeout,
+                max_consecutive_timeouts,
                 Arc::clone(&spawner),
             ))
             .detach();
@@ -366,11 +382,14 @@ async fn backend_broker(
     clients: Clients,
     backend_addr: Arc<str>,
     timeout: Duration,
+    max_consecutive_timeouts: u32,
     spawner: Arc<Executor<'static>>,
 ) {
     let mut backoff = Backoff::new();
     let mut backend: Option<BackendConn> = try_connect(&backend_addr, &spawner, &mut backoff).await;
     let mut in_flight: Option<(BackendRequest, Instant)> = None;
+    let mut last_power_state: Option<u8> = None;
+    let mut consecutive_timeouts: u32 = 0;
 
     loop {
         let event = match (backend.as_ref(), in_flight.as_ref()) {
@@ -387,6 +406,9 @@ async fn backend_broker(
                         match conn.events.try_recv() {
                             Ok(BackendEvent::Line(line)) => {
                                 if is_backend_update(&line) {
+                                    if let Some(state) = parse_upw_state(&line) {
+                                        last_power_state = Some(state);
+                                    }
                                     broadcast_update(&clients, line);
                                     continue;
                                 }
@@ -446,8 +468,26 @@ async fn backend_broker(
             }
             BrokerEvent::Backend(BackendEvent::Line(line)) => {
                 if is_backend_update(&line) {
+                    if let Some(state) = parse_upw_state(&line) {
+                        last_power_state = Some(state);
+                    }
                     broadcast_update(&clients, line);
                 } else if let Some((req, _)) = in_flight.take() {
+                    // Any matched request/response exchange confirms backend liveness.
+                    consecutive_timeouts = 0;
+                    // Some power responses are acknowledged before the backend emits
+                    // its own @UPW event; proactively fan out equivalent state now.
+                    if let Some(state) = synthetic_power_state_from_exchange(&req.msg, &line) {
+                        if last_power_state != Some(state) {
+                            let update = match state {
+                                0 => b"@UPW 0\r".as_slice(),
+                                1 => b"@UPW 1\r".as_slice(),
+                                _ => unreachable!(),
+                            };
+                            broadcast_update(&clients, update);
+                            last_power_state = Some(state);
+                        }
+                    }
                     debug!(
                         "[backend → {}] {}",
                         req.peer,
@@ -456,7 +496,7 @@ async fn backend_broker(
                     let _ = req.response_tx.send(Ok(line)).await;
                 } else {
                     warn!(
-                        "unsolicited non-update backend line: {}",
+                        "orphan non-update backend line (no in-flight request): {}",
                         String::from_utf8_lossy(&line).trim_end_matches('\r')
                     );
                 }
@@ -465,22 +505,46 @@ async fn backend_broker(
                 warn!("{reason}");
                 backend = None;
                 backoff.on_failure();
+                consecutive_timeouts = 0;
+                last_power_state = None;
                 if let Some((req, _)) = in_flight.take() {
                     let _ = req.response_tx.send(Err(reason)).await;
                 }
             }
             BrokerEvent::Timeout => {
                 if let Some((req, _)) = in_flight.take() {
+                    // Deployment invariant for this environment: if a request has
+                    // not received a response within `timeout`, that response will
+                    // never arrive later.
+                    consecutive_timeouts = consecutive_timeouts.saturating_add(1);
                     let reason = format!("backend response timed out ({} s)", timeout.as_secs());
+                    warn!(
+                        "{reason} while waiting for {} from {} (timeout occurrences {}/{})",
+                        String::from_utf8_lossy(&req.msg).trim_end_matches('\r'),
+                        req.peer,
+                        consecutive_timeouts,
+                        max_consecutive_timeouts,
+                    );
                     let _ = req.response_tx.send(Err(reason)).await;
-                    // Drop backend: protocol state may be desynced after a missed response.
-                    backend = None;
-                    backoff.on_failure();
+                    if should_drop_backend_after_timeout(
+                        consecutive_timeouts,
+                        max_consecutive_timeouts,
+                    ) {
+                        // Drop backend after repeated timeouts: backend appears unhealthy
+                        // because it is not producing responses in a timely manner.
+                        backend = None;
+                        backoff.on_failure();
+                        consecutive_timeouts = 0;
+                        last_power_state = None;
+                    }
                 }
             }
             BrokerEvent::ReconnectTick => {
                 if backend.is_none() {
                     backend = try_connect(&backend_addr, &spawner, &mut backoff).await;
+                    if backend.is_some() {
+                        consecutive_timeouts = 0;
+                    }
                 }
             }
         }
@@ -736,6 +800,40 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
     }
 }
 
+fn parse_upw_state(line: &[u8]) -> Option<u8> {
+    let body = line.strip_suffix(b"\r").unwrap_or(line);
+    match body {
+        b"@UPW 0" => Some(0),
+        b"@UPW 1" => Some(1),
+        _ => None,
+    }
+}
+
+fn synthetic_power_state_from_exchange(request: &[u8], response: &[u8]) -> Option<u8> {
+    let req = request.strip_suffix(b"\r").unwrap_or(request);
+    let resp = response.strip_suffix(b"\r").unwrap_or(response);
+
+    match (req, resp) {
+        (b"#POF", b"@POF OK OFF") | (b"#QPW", b"@QPW OK OFF") => Some(0),
+        (b"#PON", b"@PON OK ON") | (b"#QPW", b"@QPW OK ON") => Some(1),
+        _ => None,
+    }
+}
+
+/// After this many consecutive request timeouts, force backend reconnect.
+/// Smaller thresholds fail over faster; larger thresholds tolerate more transient misses.
+fn should_drop_backend_after_timeout(consecutive_timeouts: u32, max_consecutive_timeouts: u32) -> bool {
+    consecutive_timeouts >= max_consecutive_timeouts
+}
+
+fn parse_max_consecutive_timeouts(raw: &str) -> Option<u32> {
+    let parsed = raw.trim().parse::<u32>().ok()?;
+    if !matches!(parsed, 1..=100) {
+        return None;
+    }
+    Some(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,5 +928,86 @@ mod tests {
                 String::from_utf8_lossy(line),
             );
         }
+    }
+
+    #[test]
+    fn synthetic_power_update_maps_expected_ack_responses() {
+        assert_eq!(
+            synthetic_power_state_from_exchange(b"#POF\r", b"@POF OK OFF\r"),
+            Some(0)
+        );
+        assert_eq!(
+            synthetic_power_state_from_exchange(b"#QPW\r", b"@QPW OK OFF\r"),
+            Some(0)
+        );
+        assert_eq!(
+            synthetic_power_state_from_exchange(b"#PON\r", b"@PON OK ON\r"),
+            Some(1)
+        );
+        assert_eq!(
+            synthetic_power_state_from_exchange(b"#QPW\r", b"@QPW OK ON\r"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn synthetic_power_update_ignores_other_responses() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"#QPW\r", b"@QPW OK STANDBY\r"),
+            (b"#POF\r", b"@POF ERR BUSY\r"),
+            (b"#QPW\r", b"@UPW 0\r"),
+            (b"#PON\r", b"@PON OK OFF\r"),
+            (b"#QPW\r", b"@QPW OK OFFLINE\r"),
+            (b"#QVL\r", b"@QPW OK OFF\r"),
+            (b"#QVL\r", b"@QPW OK ON\r"),
+            (b"#QVL\r", b"@POF OK OFF\r"),
+            (b"#QVL\r", b"@PON OK ON\r"),
+            (b"", b""),
+        ];
+
+        for &(req, line) in cases {
+            assert_eq!(
+                synthetic_power_state_from_exchange(req, line),
+                None,
+                "req={:?}, line={:?} should not map to a synthetic @UPW update",
+                String::from_utf8_lossy(req),
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_upw_state_recognizes_power_updates() {
+        assert_eq!(parse_upw_state(b"@UPW 0\r"), Some(0));
+        assert_eq!(parse_upw_state(b"@UPW 1\r"), Some(1));
+        assert_eq!(parse_upw_state(b"@UPW 0"), Some(0));
+        assert_eq!(parse_upw_state(b"@UPW 1"), Some(1));
+        assert_eq!(parse_upw_state(b"@UPW OFF\r"), None);
+        assert_eq!(parse_upw_state(b"@QPW OK ON\r"), None);
+    }
+
+    #[test]
+    fn timeout_policy_reconnects_after_streak_threshold() {
+        assert!(!should_drop_backend_after_timeout(0, 3));
+        assert!(!should_drop_backend_after_timeout(1, 3));
+        assert!(!should_drop_backend_after_timeout(2, 3));
+        assert!(should_drop_backend_after_timeout(3, 3));
+    }
+
+    #[test]
+    fn parse_max_consecutive_timeouts_accepts_positive_values() {
+        assert_eq!(parse_max_consecutive_timeouts("1"), Some(1));
+        assert_eq!(parse_max_consecutive_timeouts("3"), Some(3));
+        assert_eq!(parse_max_consecutive_timeouts(" 7 "), Some(7));
+        assert_eq!(parse_max_consecutive_timeouts("100"), Some(100));
+    }
+
+    #[test]
+    fn parse_max_consecutive_timeouts_rejects_invalid_values() {
+        assert_eq!(parse_max_consecutive_timeouts("0"), None);
+        assert_eq!(parse_max_consecutive_timeouts("101"), None);
+        assert_eq!(parse_max_consecutive_timeouts("-1"), None);
+        assert_eq!(parse_max_consecutive_timeouts("abc"), None);
+        assert_eq!(parse_max_consecutive_timeouts(""), None);
     }
 }
