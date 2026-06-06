@@ -1,32 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v systemctl >/dev/null 2>&1; then
-  echo "systemctl is required but not installed."
-  exit 1
-fi
-
 usage() {
   cat <<'EOUSAGE'
 Usage:
-  ./install.sh [--install] [--system|--user]
-  ./install.sh --uninstall [--system|--user]
+  ./linux_install.sh [--install]
+  ./linux_install.sh --uninstall
 
 Options:
   --install     Install oppo-multiplexer (default action)
   --uninstall   Uninstall oppo-multiplexer
-  --system      Force system scope (/etc, /usr/local/bin, systemctl)
-  --user        Force user scope (~/.config, ~/.local/bin, systemctl --user)
   -h, --help    Show this help
 
 Notes:
-  - On install without --system/--user, scope is picked from listen port.
-  - Privileged listen ports (<1024) require --system and root.
+  - sudo/root is required to install and uninstall.
+  - Binary is installed to /opt/oppo-multiplexer/.
+  - Config is installed to /etc/oppo-multiplexer/.
+  - For privileged listen ports (<1024) the service runs as root.
+  - For non-privileged listen ports the service runs as the invoking user.
 EOUSAGE
 }
 
 ACTION="install"
-SCOPE_OVERRIDE=""
 for arg in "$@"; do
   case "$arg" in
     --install)
@@ -34,12 +29,6 @@ for arg in "$@"; do
       ;;
     --uninstall)
       ACTION="uninstall"
-      ;;
-    --system)
-      SCOPE_OVERRIDE="system"
-      ;;
-    --user)
-      SCOPE_OVERRIDE="user"
       ;;
     -h|--help)
       usage
@@ -53,42 +42,30 @@ for arg in "$@"; do
   esac
 done
 
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "systemctl is required but not installed."
+  exit 1
+fi
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "This script must be run with sudo/root."
+  exit 1
+fi
+
+BIN_DIR="/opt/oppo-multiplexer"
+BIN_PATH="${BIN_DIR}/oppo-multiplexer"
+ENV_DIR="/etc/oppo-multiplexer"
+ENV_FILE="${ENV_DIR}/env"
+UNIT_FILE="/etc/systemd/system/oppo-multiplexer.service"
+
 if [[ "${ACTION}" == "uninstall" ]]; then
-  INSTALL_SCOPE="${SCOPE_OVERRIDE}"
-  if [[ -z "${INSTALL_SCOPE}" ]]; then
-    if [[ "${EUID}" -eq 0 ]]; then
-      INSTALL_SCOPE="system"
-    else
-      INSTALL_SCOPE="user"
-    fi
-  fi
-
-  if [[ "${INSTALL_SCOPE}" == "system" ]]; then
-    if [[ "${EUID}" -ne 0 ]]; then
-      echo "System uninstall requires sudo/root."
-      exit 1
-    fi
-    BIN_PATH="/usr/local/bin/oppo-multiplexer"
-    ENV_FILE="/etc/default/oppo-multiplexer"
-    UNIT_FILE="/etc/systemd/system/oppo-multiplexer.service"
-    SYSTEMCTL_CMD=(systemctl)
-  else
-    if [[ "${EUID}" -eq 0 ]]; then
-      echo "User uninstall must run as the target user (no sudo), or pass --system."
-      exit 1
-    fi
-    BIN_PATH="${HOME}/.local/bin/oppo-multiplexer"
-    ENV_FILE="${HOME}/.config/oppo-multiplexer/env"
-    UNIT_FILE="${HOME}/.config/systemd/user/oppo-multiplexer.service"
-    SYSTEMCTL_CMD=(systemctl --user)
-  fi
-
-  "${SYSTEMCTL_CMD[@]}" disable --now oppo-multiplexer >/dev/null 2>&1 || true
+  systemctl disable --now oppo-multiplexer >/dev/null 2>&1 || true
   rm -f "${UNIT_FILE}" "${ENV_FILE}" "${BIN_PATH}"
-  "${SYSTEMCTL_CMD[@]}" daemon-reload
-  "${SYSTEMCTL_CMD[@]}" reset-failed >/dev/null 2>&1 || true
-
-  echo "Uninstall complete (${INSTALL_SCOPE})."
+  rmdir "${ENV_DIR}" 2>/dev/null || true
+  rmdir "${BIN_DIR}" 2>/dev/null || true
+  systemctl daemon-reload
+  systemctl reset-failed >/dev/null 2>&1 || true
+  echo "Uninstall complete."
   exit 0
 fi
 
@@ -143,55 +120,20 @@ if ! [[ "${TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-# Requirement:
-# - privileged listen port (<1024): run as root
-# - non-privileged listen port: install/run as current user
-INSTALL_SCOPE=""
-BIN_PATH=""
-ENV_FILE=""
-UNIT_FILE=""
-WANTED_BY=""
-SYSTEMCTL_CMD=()
-if [[ "${SCOPE_OVERRIDE}" == "system" ]]; then
-  INSTALL_SCOPE="system"
-elif [[ "${SCOPE_OVERRIDE}" == "user" ]]; then
-  INSTALL_SCOPE="user"
-elif (( LISTEN_PORT < 1024 )); then
-  INSTALL_SCOPE="system"
+# Privileged ports (<1024): service runs as root.
+# Non-privileged ports: service runs as the invoking user.
+SERVICE_USER=""
+SERVICE_GROUP=""
+if (( LISTEN_PORT < 1024 )); then
+  echo "Privileged listen port ${LISTEN_PORT}: service will run as root."
 else
-  INSTALL_SCOPE="user"
-fi
-
-if [[ "${INSTALL_SCOPE}" == "system" ]]; then
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "System install requires sudo/root."
+  if [[ -z "${SUDO_USER:-}" || "${SUDO_USER}" == "root" ]]; then
+    echo "For non-privileged listen ports, re-run as: sudo ./linux_install.sh (from your normal user account)."
     exit 1
   fi
-  if (( LISTEN_PORT >= 1024 )) && [[ "${SCOPE_OVERRIDE}" == "system" ]]; then
-    echo "Using system scope by explicit --system override."
-  fi
-  BIN_PATH="/usr/local/bin/oppo-multiplexer"
-  ENV_FILE="/etc/default/oppo-multiplexer"
-  UNIT_FILE="/etc/systemd/system/oppo-multiplexer.service"
-  WANTED_BY="multi-user.target"
-  SYSTEMCTL_CMD=(systemctl)
-  echo "Using system service as root."
-else
-  if [[ "${EUID}" -eq 0 ]]; then
-    echo "User install must run as your normal user (no sudo)."
-    exit 1
-  fi
-  if (( LISTEN_PORT < 1024 )); then
-    echo "Listen port ${LISTEN_PORT} is privileged; use --system with sudo/root instead."
-    exit 1
-  fi
-  BIN_PATH="${HOME}/.local/bin/oppo-multiplexer"
-  ENV_FILE="${HOME}/.config/oppo-multiplexer/env"
-  UNIT_FILE="${HOME}/.config/systemd/user/oppo-multiplexer.service"
-  WANTED_BY="default.target"
-  SYSTEMCTL_CMD=(systemctl --user)
-  mkdir -p "${HOME}/.local/bin" "${HOME}/.config/oppo-multiplexer" "${HOME}/.config/systemd/user"
-  echo "Using user service."
+  SERVICE_USER="${SUDO_USER}"
+  SERVICE_GROUP="$(id -gn "${SUDO_USER}")"
+  echo "Non-privileged listen port ${LISTEN_PORT}: service will run as ${SERVICE_USER}:${SERVICE_GROUP}."
 fi
 
 ASSET="oppo-multiplexer-linux-${ARCH}.tar.gz"
@@ -205,7 +147,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
 echo "Downloading ${URL}"
-curl --proto "=https" --tlsv1.2 -sSf -fL "${URL}" -o "${TMP_DIR}/${ASSET}"
+curl --proto "=https" --tlsv1.2 -sSfL "${URL}" -o "${TMP_DIR}/${ASSET}"
 tar -xzf "${TMP_DIR}/${ASSET}" -C "${TMP_DIR}"
 
 if [[ ! -f "${TMP_DIR}/oppo-multiplexer" ]]; then
@@ -213,7 +155,15 @@ if [[ ! -f "${TMP_DIR}/oppo-multiplexer" ]]; then
   exit 1
 fi
 
+mkdir -p "${BIN_DIR}" "${ENV_DIR}"
 install -m 755 "${TMP_DIR}/oppo-multiplexer" "${BIN_PATH}"
+
+# Config readable by root and the service user only.
+if [[ -n "${SERVICE_USER}" ]]; then
+  ENV_GROUP="${SERVICE_GROUP}"
+else
+  ENV_GROUP="root"
+fi
 
 cat > "${ENV_FILE}" <<EOCFG
 OPPO_HOST=${OPPO_HOST}
@@ -222,7 +172,10 @@ LISTEN_PORT=${LISTEN_PORT}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS}
 RUST_LOG=info
 EOCFG
+chown "root:${ENV_GROUP}" "${ENV_FILE}"
+chmod 640 "${ENV_FILE}"
 
+# Build the unit, inserting User/Group only for non-privileged installs.
 cat > "${UNIT_FILE}" <<EOUNIT
 [Unit]
 Description=OPPO Multiplexer
@@ -242,25 +195,27 @@ ProtectSystem=full
 ProtectHome=true
 EOUNIT
 
-cat >> "${UNIT_FILE}" <<EOUNIT
+if [[ -n "${SERVICE_USER}" ]]; then
+  {
+    echo "User=${SERVICE_USER}"
+    echo "Group=${SERVICE_GROUP}"
+  } >> "${UNIT_FILE}"
+fi
+
+cat >> "${UNIT_FILE}" <<'EOUNIT'
 
 [Install]
-WantedBy=${WANTED_BY}
+WantedBy=multi-user.target
 EOUNIT
 
-"${SYSTEMCTL_CMD[@]}" daemon-reload
-"${SYSTEMCTL_CMD[@]}" enable --now oppo-multiplexer
+systemctl daemon-reload
+systemctl enable --now oppo-multiplexer
 
 echo
 echo "Install complete."
-if [[ "${INSTALL_SCOPE}" == "system" ]]; then
-  systemctl status oppo-multiplexer --no-pager || true
-  echo
-  echo "Config: ${ENV_FILE}"
-  echo "Logs:   journalctl -u oppo-multiplexer -f"
-else
-  systemctl --user status oppo-multiplexer --no-pager || true
-  echo
-  echo "Config: ${ENV_FILE}"
-  echo "Logs:   journalctl --user -u oppo-multiplexer -f"
-fi
+systemctl status oppo-multiplexer --no-pager || true
+echo
+echo "Binary: ${BIN_PATH}"
+echo "Config: ${ENV_FILE}"
+echo "Logs:   journalctl -u oppo-multiplexer -f"
+echo "        journalctl -b -t oppo-multiplexer"
