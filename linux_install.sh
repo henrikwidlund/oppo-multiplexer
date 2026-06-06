@@ -122,8 +122,8 @@ if ! [[ "${TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
   echo "Invalid timeout seconds: ${TIMEOUT_SECONDS}"
   exit 1
 fi
-if ! [[ "${MAX_CONSECUTIVE_TIMEOUTS}" =~ ^[0-9]+$ ]] || (( MAX_CONSECUTIVE_TIMEOUTS < 1 )); then
-  echo "Invalid max consecutive timeouts: ${MAX_CONSECUTIVE_TIMEOUTS} (must be >= 1)"
+if ! [[ "${MAX_CONSECUTIVE_TIMEOUTS}" =~ ^[0-9]+$ ]] || (( MAX_CONSECUTIVE_TIMEOUTS < 1 || MAX_CONSECUTIVE_TIMEOUTS > 100 )); then
+  echo "Invalid max consecutive timeouts: ${MAX_CONSECUTIVE_TIMEOUTS} (must be in the range 1-100)"
   exit 1
 fi
 

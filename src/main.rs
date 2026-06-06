@@ -174,7 +174,7 @@ fn main() {
     let max_consecutive_timeouts = if args.len() == 5 {
         parse_max_consecutive_timeouts(&args[4]).unwrap_or_else(|| {
             eprintln!(
-                "Invalid max_consecutive_timeouts: '{}' must be an integer in the the range 1-100",
+                "Invalid max_consecutive_timeouts: '{}' must be an integer in the range 1-100",
                 args[4]
             );
             std::process::exit(1);
@@ -828,7 +828,7 @@ fn should_drop_backend_after_timeout(consecutive_timeouts: u32, max_consecutive_
 
 fn parse_max_consecutive_timeouts(raw: &str) -> Option<u32> {
     let parsed = raw.trim().parse::<u32>().ok()?;
-    if parsed == 0 {
+    if !matches!(parsed, 1..=100) {
         return None;
     }
     Some(parsed)
@@ -999,11 +999,13 @@ mod tests {
         assert_eq!(parse_max_consecutive_timeouts("1"), Some(1));
         assert_eq!(parse_max_consecutive_timeouts("3"), Some(3));
         assert_eq!(parse_max_consecutive_timeouts(" 7 "), Some(7));
+        assert_eq!(parse_max_consecutive_timeouts("100"), Some(100));
     }
 
     #[test]
     fn parse_max_consecutive_timeouts_rejects_invalid_values() {
         assert_eq!(parse_max_consecutive_timeouts("0"), None);
+        assert_eq!(parse_max_consecutive_timeouts("101"), None);
         assert_eq!(parse_max_consecutive_timeouts("-1"), None);
         assert_eq!(parse_max_consecutive_timeouts("abc"), None);
         assert_eq!(parse_max_consecutive_timeouts(""), None);
