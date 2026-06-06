@@ -406,6 +406,9 @@ async fn backend_broker(
                         match conn.events.try_recv() {
                             Ok(BackendEvent::Line(line)) => {
                                 if is_backend_update(&line) {
+                                    if let Some(state) = parse_upw_state(&line) {
+                                        last_power_state = Some(state);
+                                    }
                                     broadcast_update(&clients, line);
                                     continue;
                                 }
@@ -493,7 +496,7 @@ async fn backend_broker(
                     let _ = req.response_tx.send(Ok(line)).await;
                 } else {
                     warn!(
-                        "unsolicited non-update backend line: {}",
+                        "orphan non-update backend line (no in-flight request; possible late response after timeout): {}",
                         String::from_utf8_lossy(&line).trim_end_matches('\r')
                     );
                 }
@@ -509,6 +512,9 @@ async fn backend_broker(
             }
             BrokerEvent::Timeout => {
                 if let Some((req, _)) = in_flight.take() {
+                    // Deployment invariant for this environment: if a request has
+                    // not received a response within `timeout`, that response will
+                    // never arrive later.
                     consecutive_timeouts = consecutive_timeouts.saturating_add(1);
                     let reason = format!("backend response timed out ({} s)", timeout.as_secs());
                     warn!(
