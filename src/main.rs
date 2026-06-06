@@ -965,7 +965,7 @@ mod tests {
             (b"", b""),
         ];
 
-        for (req, line) in cases {
+        for &(req, line) in cases {
             assert_eq!(
                 synthetic_power_state_from_exchange(req, line),
                 None,
