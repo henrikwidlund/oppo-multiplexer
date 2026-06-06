@@ -506,6 +506,7 @@ async fn backend_broker(
                 backend = None;
                 backoff.on_failure();
                 consecutive_timeouts = 0;
+                last_power_state = None;
                 if let Some((req, _)) = in_flight.take() {
                     let _ = req.response_tx.send(Err(reason)).await;
                 }
@@ -534,6 +535,7 @@ async fn backend_broker(
                         backend = None;
                         backoff.on_failure();
                         consecutive_timeouts = 0;
+                        last_power_state = None;
                     }
                 }
             }
