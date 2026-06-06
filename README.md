@@ -21,7 +21,7 @@ oppo-multiplexer <listen_port> <backend_host:backend_port> <timeout_seconds> [ma
 - `listen_port` — port to accept incoming client connections on
 - `backend_host:backend_port` — address of the Oppo player
 - `timeout_seconds` — how long to wait for a response from the player before giving up
-- `max_consecutive_timeouts` — optional; reconnect backend only after this many consecutive timed-out requests (default: `3`, must be `>= 1`)
+- `max_consecutive_timeouts` — optional; reconnect backend only after this many consecutive timed-out requests (default: `3`, must be in the range `1-100`)
 
 Example:
 
