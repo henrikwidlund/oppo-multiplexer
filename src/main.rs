@@ -162,9 +162,9 @@ enum BrokerEvent {
 }
 
 #[cfg(target_os = "linux")]
-/// Sets up tracing via journald, falling back to stdout if the journald socket
-/// is unavailable (e.g. running outside systemd). Level is controlled by
-/// `RUST_LOG`, defaulting to `info`.
+/// Sets up tracing via journald, falling back to the default `fmt` subscriber
+/// (stderr) if the journald socket is unavailable (e.g. running outside
+/// systemd). Level is controlled by `RUST_LOG`, defaulting to `info`.
 fn init_logging() {
     use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
@@ -178,14 +178,14 @@ fn init_logging() {
                 .expect("failed to set global tracing subscriber");
         }
         Err(e) => {
-            eprintln!("journald unavailable ({e}), falling back to stdout");
+            eprintln!("journald unavailable ({e}), falling back to stderr");
             tracing_subscriber::fmt().with_env_filter(filter).init();
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-/// Sets up tracing via stdout/stderr.
+/// Sets up tracing via stderr.
 /// Level is controlled by `RUST_LOG`, defaulting to `info`.
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
