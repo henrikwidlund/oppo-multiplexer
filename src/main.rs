@@ -259,7 +259,7 @@ fn main() {
 
         loop {
             match listener.accept().await {
-                Ok((mut stream, addr)) => {
+                Ok((stream, addr)) => {
                     // Single-task accept loop, so this load+add cannot race with
                     // another accept. Decrements happen on `ClientSlotGuard::drop`
                     // inside the spawned task.
@@ -267,7 +267,12 @@ fn main() {
                         warn!(
                             "rejecting client {addr}: {MAX_CLIENTS} concurrent clients already active"
                         );
-                        let _ = write_with_timeout(&mut stream, b"ERROR: server full\r").await;
+                        // Close immediately rather than writing a courtesy "ERROR:"
+                        // line. An async write here would block the single accept
+                        // loop if the peer never reads (or advertises a zero
+                        // window), turning the cap itself into the availability
+                        // problem under a connection flood.
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
                         drop(stream);
                         continue;
                     }
