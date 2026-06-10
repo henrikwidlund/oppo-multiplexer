@@ -3,12 +3,15 @@ use smol::{
     channel::{self, Receiver, Sender, TrySendError},
     Executor,
     Timer,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, LazyLock, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
@@ -31,7 +34,25 @@ const REQUEST_CHANNEL_CAP: usize = 32;
 const CLIENT_OUT_CAP: usize = 256;
 const BACKEND_EVENT_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+/// Hard cap on concurrent accepted clients. Prevents a connection flood from
+/// spawning unbounded tasks (each holds channels + TcpStream clones). Existing
+/// clients are not affected; new ones over the cap are refused at accept time.
+const MAX_CLIENTS: usize = 11;
+/// Hard cap on a single `\r`-terminated line from either a client or the
+/// backend. Prevents a peer that never sends `\r` from growing the read
+/// buffer without bound (OOM/DoS). Oppo protocol lines are <100 bytes in
+/// practice
+const MAX_LINE_LEN: usize = 4096;
+
+/// Pre-built shared payloads for synthesized `@UPW` broadcasts. Avoids a heap
+/// allocation per power-state transition that would otherwise happen inside
+/// `Arc::from(&'static [u8])`.
+static SYNTHETIC_UPW_OFF: LazyLock<Arc<[u8]>> =
+    LazyLock::new(|| Arc::from(b"@UPW 0\r".as_slice()));
+static SYNTHETIC_UPW_ON: LazyLock<Arc<[u8]>> =
+    LazyLock::new(|| Arc::from(b"@UPW 1\r".as_slice()));
 
 /// Linear backoff for backend reconnect attempts. Tracks both the current
 /// wait duration and the absolute time of the next allowed attempt. Both the
@@ -74,6 +95,17 @@ impl Backoff {
     fn on_failure(&mut self) {
         self.current = (self.current + Self::STEP).min(Self::MAX);
         self.next_attempt_at = Instant::now() + self.current;
+    }
+}
+
+/// RAII counter slot for `MAX_CLIENTS`. Increment happens at accept time in
+/// `main`; the guard is moved into `handle_client`, and dropping it (clean
+/// exit, break-out, panic, or task cancellation) decrements the counter.
+struct ClientSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -130,18 +162,26 @@ enum BrokerEvent {
 }
 
 #[cfg(target_os = "linux")]
-/// Sets up tracing via journald.
-/// Level is controlled by `RUST_LOG`, defaulting to `info`.
+/// Sets up tracing via journald, falling back to stdout if the journald socket
+/// is unavailable (e.g. running outside systemd). Level is controlled by
+/// `RUST_LOG`, defaulting to `info`.
 fn init_logging() {
     use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    let journald = tracing_journald::layer().expect("failed to connect to journald socket");
-    let subscriber = tracing_subscriber::registry()
-        .with(filter)
-        .with(journald);
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("failed to set global tracing subscriber");
+    match tracing_journald::layer() {
+        Ok(journald) => {
+            let subscriber = tracing_subscriber::registry()
+                .with(filter)
+                .with(journald);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("failed to set global tracing subscriber");
+        }
+        Err(e) => {
+            eprintln!("journald unavailable ({e}), falling back to stdout");
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -165,12 +205,20 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let listen_port = args[1].clone();
+    let listen_port = args[1].parse::<u16>().unwrap_or_else(|_| {
+        eprintln!("Invalid listen_port: '{}' is not a valid TCP port (0-65535)", args[1]);
+        std::process::exit(1);
+    });
     let backend_addr: Arc<str> = args[2].as_str().into();
-    let timeout = Duration::from_secs(args[3].parse::<u64>().unwrap_or_else(|_| {
+    let timeout_secs = args[3].parse::<u64>().unwrap_or_else(|_| {
         eprintln!("Invalid timeout_seconds: '{}' is not a non-negative integer", args[3]);
         std::process::exit(1);
-    }));
+    });
+    if timeout_secs == 0 {
+        eprintln!("Invalid timeout_seconds: must be > 0");
+        std::process::exit(1);
+    }
+    let timeout = Duration::from_secs(timeout_secs);
     let max_consecutive_timeouts = if args.len() == 5 {
         parse_max_consecutive_timeouts(&args[4]).unwrap_or_else(|| {
             eprintln!(
@@ -188,6 +236,7 @@ fn main() {
 
     smol::block_on(ex.run(async move {
         let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+        let active_clients = Arc::new(AtomicUsize::new(0));
         let (request_tx, request_rx) = channel::bounded::<BackendRequest>(REQUEST_CHANNEL_CAP);
 
         spawner
@@ -210,7 +259,20 @@ fn main() {
 
         loop {
             match listener.accept().await {
-                Ok((stream, addr)) => {
+                Ok((mut stream, addr)) => {
+                    // Single-task accept loop, so this load+add cannot race with
+                    // another accept. Decrements happen on `ClientSlotGuard::drop`
+                    // inside the spawned task.
+                    if active_clients.load(Ordering::Acquire) >= MAX_CLIENTS {
+                        warn!(
+                            "rejecting client {addr}: {MAX_CLIENTS} concurrent clients already active"
+                        );
+                        let _ = write_with_timeout(&mut stream, b"ERROR: server full\r").await;
+                        drop(stream);
+                        continue;
+                    }
+                    active_clients.fetch_add(1, Ordering::AcqRel);
+                    let slot = ClientSlotGuard(Arc::clone(&active_clients));
                     info!("client {addr} connected");
                     let client_id = next_client_id;
                     next_client_id = next_client_id.wrapping_add(1);
@@ -221,6 +283,7 @@ fn main() {
                             request_tx.clone(),
                             Arc::clone(&clients),
                             Arc::clone(&spawner),
+                            slot,
                         ))
                         .detach();
                 }
@@ -231,6 +294,61 @@ fn main() {
 }
 
 // ---------- helpers ----------
+
+/// Bounded variant of `AsyncBufReadExt::read_until`: appends bytes into `buf`
+/// until `delim` is found or EOF, but fails with `InvalidData` if the line
+/// would exceed `max` bytes. Prevents a peer that never sends `delim` from
+/// growing `buf` without bound.
+async fn read_until_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    delim: u8,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize> {
+    let start = buf.len();
+    loop {
+        let (consumed, found) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(buf.len() - start);
+            }
+            let (n, found) = match available.iter().position(|&b| b == delim) {
+                Some(i) => (i + 1, true),
+                None => (available.len(), false),
+            };
+            if buf.len() - start + n > max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line exceeded max length",
+                ));
+            }
+            buf.extend_from_slice(&available[..n]);
+            (n, found)
+        };
+        std::pin::Pin::new(&mut *reader).consume(consumed);
+        if found {
+            return Ok(buf.len() - start);
+        }
+    }
+}
+
+/// Writes `data` to `stream`, failing with `TimedOut` if the kernel does not
+/// accept it within `BACKEND_WRITE_TIMEOUT`. A stuck TCP send buffer would
+/// otherwise block the broker indefinitely; on timeout the caller drops the
+/// connection (since a partial write may have already landed).
+async fn write_with_timeout(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+    future::or(
+        async { stream.write_all(data).await },
+        async {
+            Timer::after(BACKEND_WRITE_TIMEOUT).await;
+            Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend write timed out",
+            ))
+        },
+    )
+    .await
+}
 
 /// Attempt one TCP connect to the backend, capped by `CONNECT_TIMEOUT` so a
 /// silent-drop player cannot hang the broker for the OS-default minutes.
@@ -253,7 +371,9 @@ async fn try_connect(
     match result {
         Ok(stream) => {
             // Disable Nagle's algorithm — we send small commands and need low latency.
-            let _ = stream.set_nodelay(true);
+            if let Err(e) = stream.set_nodelay(true) {
+                warn!("set_nodelay on backend connection failed: {e}");
+            }
             info!("connected to backend at {addr}");
             let writer = stream.clone();
             let (events_tx, events_rx) = channel::bounded::<BackendEvent>(BACKEND_EVENT_CAP);
@@ -289,7 +409,7 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     let mut buf = Vec::with_capacity(256);
     loop {
         buf.clear();
-        match reader.read_until(b'\r', &mut buf).await {
+        match read_until_capped(&mut reader, b'\r', &mut buf, MAX_LINE_LEN).await {
             Ok(0) => {
                 let _ = tx
                     .send(BackendEvent::Error("backend closed connection".to_string()))
@@ -307,11 +427,11 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                 return;
             }
             Ok(_) => {
-                // Hand the filled buffer off and pre-allocate a fresh one in its
-                // place. capacity().max(256) preserves the high-water mark so a
-                // previously-grown buffer doesn't shrink back to the default.
-                let next_capacity = buf.capacity().max(256);
-                let line = std::mem::replace(&mut buf, Vec::with_capacity(next_capacity));
+                // Hand the filled buffer off and pre-allocate a fresh one with
+                // the same capacity so a previously-grown buffer keeps its
+                // high-water mark instead of shrinking back to the default.
+                let cap = buf.capacity();
+                let line = std::mem::replace(&mut buf, Vec::with_capacity(cap));
 
                 // Updates are fire-and-forget telemetry (a fresh @UTC arrives every
                 // second). If the broker is briefly stalled — e.g. inside a 3s
@@ -479,9 +599,9 @@ async fn backend_broker(
                     // its own @UPW event; proactively fan out equivalent state now.
                     if let Some(state) = synthetic_power_state_from_exchange(&req.msg, &line) {
                         if last_power_state != Some(state) {
-                            let update = match state {
-                                0 => b"@UPW 0\r".as_slice(),
-                                1 => b"@UPW 1\r".as_slice(),
+                            let update: Arc<[u8]> = match state {
+                                0 => Arc::clone(&SYNTHETIC_UPW_OFF),
+                                1 => Arc::clone(&SYNTHETIC_UPW_ON),
                                 _ => unreachable!(),
                             };
                             broadcast_update(&clients, update);
@@ -515,7 +635,14 @@ async fn backend_broker(
                 if let Some((req, _)) = in_flight.take() {
                     // Deployment invariant for this environment: if a request has
                     // not received a response within `timeout`, that response will
-                    // never arrive later.
+                    // never arrive later. If that invariant is violated, a late
+                    // response would land while a *different* request is in-flight
+                    // and be misdelivered as that request's response. The
+                    // `max_consecutive_timeouts` threshold below doubles as the
+                    // safety net for this: after enough timeouts in a row we drop
+                    // the backend connection, which evicts any late bytes still
+                    // queued in the kernel/reader pipeline so they cannot match a
+                    // future request.
                     consecutive_timeouts = consecutive_timeouts.saturating_add(1);
                     let reason = format!("backend response timed out ({} s)", timeout.as_secs());
                     warn!(
@@ -597,7 +724,7 @@ async fn handle_new_request(
     let mut retry_after_write_fail = false;
 
     if let Some(conn) = backend.as_mut() {
-        match conn.writer.write_all(&req.msg).await {
+        match write_with_timeout(&mut conn.writer, &req.msg).await {
             Ok(()) => {
                 debug!(
                     "[{} → backend] {}",
@@ -630,7 +757,7 @@ async fn handle_new_request(
         return;
     };
 
-    match conn.writer.write_all(&req.msg).await {
+    match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
             debug!(
                 "[{} → backend] {}",
@@ -663,6 +790,7 @@ async fn handle_client(
     request_tx: Sender<BackendRequest>,
     clients: Clients,
     spawner: Arc<Executor<'static>>,
+    _slot: ClientSlotGuard,
 ) {
     let peer: Arc<str> = stream
         .peer_addr()
@@ -670,7 +798,9 @@ async fn handle_client(
         .map(|a| a.to_string())
         .unwrap_or_else(|| "?".to_string())
         .into();
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("set_nodelay on client {peer} failed: {e}");
+    }
 
     // Three TcpStream clones share the same underlying socket: one for the
     // writer task, one stored in the clients map so broadcast can force a
@@ -705,18 +835,23 @@ async fn handle_client(
         // Disconnect on read error or any line not terminated by `\r` (clean
         // EOF and EOF mid-line both leave the buffer without the terminator).
         // Forwarding a truncated command could make the player execute a
-        // partial command.
-        if client.read_until(b'\r', &mut msg).await.is_err() || msg.last() != Some(&b'\r') {
+        // partial command. `read_until_capped` also enforces MAX_LINE_LEN, so
+        // a client that never sends `\r` cannot grow `msg` without bound.
+        if read_until_capped(&mut client, b'\r', &mut msg, MAX_LINE_LEN)
+            .await
+            .is_err()
+            || msg.last() != Some(&b'\r')
+        {
             break;
         }
 
         let (response_tx, response_rx) = channel::bounded(1);
         // Same pattern as backend_reader: hand the buffer off and pre-allocate a
-        // fresh one so the next read_until has no growth churn.
-        let next_capacity = msg.capacity().max(256);
+        // fresh one with the same capacity so the next read has no growth churn.
+        let cap = msg.capacity();
         let req = BackendRequest {
             peer: Arc::clone(&peer),
-            msg: std::mem::replace(&mut msg, Vec::with_capacity(next_capacity)),
+            msg: std::mem::replace(&mut msg, Vec::with_capacity(cap)),
             response_tx,
         };
 
@@ -1009,5 +1144,58 @@ mod tests {
         assert_eq!(parse_max_consecutive_timeouts("-1"), None);
         assert_eq!(parse_max_consecutive_timeouts("abc"), None);
         assert_eq!(parse_max_consecutive_timeouts(""), None);
+    }
+
+    #[test]
+    fn read_until_capped_reads_complete_line() {
+        let input: &[u8] = b"#QPW\rrest";
+        let mut reader = BufReader::with_capacity(64, futures_lite::io::Cursor::new(input));
+        let mut buf = Vec::new();
+        let n = future::block_on(read_until_capped(&mut reader, b'\r', &mut buf, 4096)).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(buf.as_slice(), b"#QPW\r");
+    }
+
+    #[test]
+    fn read_until_capped_returns_zero_on_immediate_eof() {
+        let mut reader = BufReader::with_capacity(64, futures_lite::io::Cursor::new(&[][..]));
+        let mut buf = Vec::new();
+        let n = future::block_on(read_until_capped(&mut reader, b'\r', &mut buf, 4096)).unwrap();
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn read_until_capped_truncated_line_returns_partial_bytes() {
+        let input: &[u8] = b"@UPW 0";
+        let mut reader = BufReader::with_capacity(64, futures_lite::io::Cursor::new(input));
+        let mut buf = Vec::new();
+        let n = future::block_on(read_until_capped(&mut reader, b'\r', &mut buf, 4096)).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(buf.last(), Some(&b'0'));
+        assert_ne!(buf.last(), Some(&b'\r'));
+    }
+
+    #[test]
+    fn read_until_capped_rejects_oversized_line() {
+        // 100 bytes of 'a' then \r, with max=50 — must error before crossing the cap.
+        let mut input = vec![b'a'; 100];
+        input.push(b'\r');
+        let mut reader = BufReader::with_capacity(16, futures_lite::io::Cursor::new(input));
+        let mut buf = Vec::new();
+        let err = future::block_on(read_until_capped(&mut reader, b'\r', &mut buf, 50))
+            .expect_err("expected InvalidData on oversize line");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_until_capped_spans_multiple_fill_buf_calls() {
+        // BufReader capacity 4 forces multiple fill_buf rounds before \r is found.
+        let input: &[u8] = b"abcdefghij\r";
+        let mut reader = BufReader::with_capacity(4, futures_lite::io::Cursor::new(input));
+        let mut buf = Vec::new();
+        let n = future::block_on(read_until_capped(&mut reader, b'\r', &mut buf, 64)).unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(buf.as_slice(), b"abcdefghij\r");
     }
 }
