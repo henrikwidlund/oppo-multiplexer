@@ -43,7 +43,7 @@ const MAX_CLIENTS: usize = 11;
 /// Hard cap on a single `\r`-terminated line from either a client or the
 /// backend. Prevents a peer that never sends `\r` from growing the read
 /// buffer without bound (OOM/DoS). Oppo protocol lines are <100 bytes in
-/// practice
+/// practice.
 const MAX_LINE_LEN: usize = 4096;
 
 /// Pre-built shared payloads for synthesized `@UPW` broadcasts. Avoids a heap
@@ -206,9 +206,14 @@ fn main() {
         std::process::exit(1);
     }
     let listen_port = args[1].parse::<u16>().unwrap_or_else(|_| {
-        eprintln!("Invalid listen_port: '{}' is not a valid TCP port (0-65535)", args[1]);
+        eprintln!("Invalid listen_port: '{}' is not a valid TCP port (1-65535)", args[1]);
         std::process::exit(1);
     });
+    if listen_port == 0 {
+        // Port 0 would have the OS pick an ephemeral port.
+        eprintln!("Invalid listen_port: 0 is not allowed (use 1-65535)");
+        std::process::exit(1);
+    }
     let backend_addr: Arc<str> = args[2].as_str().into();
     let timeout_secs = args[3].parse::<u64>().unwrap_or_else(|_| {
         eprintln!("Invalid timeout_seconds: '{}' is not a non-negative integer", args[3]);
