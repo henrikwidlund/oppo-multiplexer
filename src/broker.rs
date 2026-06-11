@@ -546,16 +546,15 @@ async fn handle_new_request(
         return;
     };
 
-    // No rate-limit sleep here. The 100 ms minimum is already preserved:
-    // either the broker's main-loop gate held the request until at least
-    // MIN_REQUEST_INTERVAL had passed since the previous successful write,
-    // or there has been no successful write yet (last_request_sent_at is
-    // None). The retry path then adds time on top (failed-write detection +
-    // a real TCP handshake inside try_connect — never zero), so the
-    // spacing from the previous successful write is always ≥
-    // MIN_REQUEST_INTERVAL. Sleeping here would block the broker while the
-    // new backend_reader is already running, risking dropped @U?? updates
-    // once BACKEND_EVENT_CAP fills.
+    // No additional rate-limit sleep here. The broker's main-loop gate
+    // already enforced ≥ MIN_REQUEST_INTERVAL since the previous
+    // *successful* write (tracked in `last_request_sent_at`). Note: on
+    // the reconnect-and-retry path after a primary write error, the two
+    // write attempts in this single request can be < MIN_REQUEST_INTERVAL
+    // apart — this is the bounded carve-out documented on the
+    // MIN_REQUEST_INTERVAL constant. Enforcing the gate here instead
+    // would block the broker while the freshly-spawned backend_reader is
+    // running, risking dropped @U?? updates once BACKEND_EVENT_CAP fills.
     match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
             let now = Instant::now();
