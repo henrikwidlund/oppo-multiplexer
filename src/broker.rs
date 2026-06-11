@@ -313,6 +313,17 @@ pub async fn backend_broker(
                 // unsolicited updates (@U??) and any other inbound lines are
                 // forwarded to clients during the cooldown — the rate limit
                 // only throttles us → player, never player → us.
+                //
+                // Recreating the Timer each iteration looks like it could
+                // starve requests under a flood of events (event arm keeps
+                // winning, gated_req's Timer keeps getting cancelled). It does
+                // not: `last_request_sent_at` is fixed at the last write, so
+                // `rate_wait` shrinks monotonically with wall-clock. After
+                // MIN_REQUEST_INTERVAL has elapsed since the last write,
+                // `rate_wait` is `Duration::ZERO` permanently, the Timer
+                // branch is skipped, and gated_req is just `recv_request()` —
+                // which `future::or` polls before the event arm, so a queued
+                // request wins. Max request delay is thus MIN_REQUEST_INTERVAL.
                 let rate_wait = match last_request_sent_at {
                     Some(t) => MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed()),
                     None => Duration::ZERO,
@@ -622,8 +633,11 @@ mod tests {
         let mut last: Option<Instant> = None;
         let start = Instant::now();
         smol::block_on(await_rate_limit_and_mark(&mut last));
+        // Threshold is relative to MIN_REQUEST_INTERVAL so it scales if the
+        // interval is ever changed. Half-interval is well under "intentional
+        // sleep" and still tolerates CI scheduler jitter.
         assert!(
-            start.elapsed() < Duration::from_millis(50),
+            start.elapsed() < MIN_REQUEST_INTERVAL / 2,
             "first call should not sleep"
         );
         assert!(last.is_some(), "first call should stamp last_sent_at");
@@ -654,7 +668,7 @@ mod tests {
         let start = Instant::now();
         smol::block_on(await_rate_limit_and_mark(&mut last));
         assert!(
-            start.elapsed() < Duration::from_millis(50),
+            start.elapsed() < MIN_REQUEST_INTERVAL / 2,
             "should not sleep when interval already elapsed"
         );
     }
