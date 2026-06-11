@@ -80,8 +80,8 @@ struct ConnSlot {
     backend: Option<BackendConn>,
     backoff: Backoff,
     in_flight: Option<(BackendRequest, Instant)>,
-    /// Wall-clock of the last successful write to the player; drives the
-    /// rate-limit gate in `backend_broker`.
+    /// Monotonic timestamp (`Instant`) of the last successful write to the
+    /// player; drives the rate-limit gate in `backend_broker`.
     last_request_sent_at: Option<Instant>,
 }
 
@@ -641,18 +641,13 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_remaining_positive_when_just_sent() {
+    fn rate_limit_remaining_bounded_by_interval_when_just_sent() {
         let just_now = Instant::now();
         let remaining = rate_limit_remaining(Some(just_now));
-        // Only assert the invariants that don't depend on scheduler timing:
-        // remaining must be > 0 (we haven't waited the full interval yet) and
-        // must never exceed MIN_REQUEST_INTERVAL. A tighter lower bound (e.g.
-        // "near MIN_REQUEST_INTERVAL") would be flaky on loaded CI runners
-        // where >10 ms can elapse between `Instant::now()` and the call.
-        assert!(
-            remaining > Duration::ZERO,
-            "expected positive remaining wait, got {remaining:?}"
-        );
+        // Only the upper bound is scheduler-independent. The thread could be
+        // descheduled for ≥ MIN_REQUEST_INTERVAL between `Instant::now()` and
+        // this call (especially on a loaded CI runner), legitimately driving
+        // `remaining` to 0 — so a positive lower bound would be flaky.
         assert!(
             remaining <= MIN_REQUEST_INTERVAL,
             "remaining {remaining:?} must not exceed {MIN_REQUEST_INTERVAL:?}"
