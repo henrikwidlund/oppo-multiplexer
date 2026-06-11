@@ -307,9 +307,23 @@ pub async fn backend_broker(
                 }
             }
             (Some(conn), None) => {
-                // Bias requests over backend events: requests are latency-sensitive
-                // (someone pressed a button), updates are passive state changes.
-                future::or(recv_request(&request_rx), recv_backend_event(&conn.events)).await
+                // Gate request pulls on MIN_REQUEST_INTERVAL so we never send
+                // commands to the player faster than the rate limit allows.
+                // The backend-event arm runs concurrently with the gate, so
+                // unsolicited updates (@U??) and any other inbound lines are
+                // forwarded to clients during the cooldown — the rate limit
+                // only throttles us → player, never player → us.
+                let rate_wait = match last_request_sent_at {
+                    Some(t) => MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed()),
+                    None => Duration::ZERO,
+                };
+                let gated_req = async {
+                    if !rate_wait.is_zero() {
+                        Timer::after(rate_wait).await;
+                    }
+                    recv_request(&request_rx).await
+                };
+                future::or(gated_req, recv_backend_event(&conn.events)).await
             }
             (None, _) => {
                 let delay = backoff.delay_until_ready();
@@ -474,9 +488,12 @@ async fn handle_new_request(
     let mut retry_after_write_fail = false;
 
     if let Some(conn) = backend.as_mut() {
-        await_rate_limit_and_mark(last_request_sent_at).await;
+        // No inner rate-limit sleep on this path: broker's (Some, None) select
+        // arm gated the request pull, so MIN_REQUEST_INTERVAL is already
+        // satisfied. Just stamp on success so the next pull's gate is correct.
         match write_with_timeout(&mut conn.writer, &req.msg).await {
             Ok(()) => {
+                *last_request_sent_at = Some(Instant::now());
                 debug!(
                     "[{} → backend] {}",
                     req.peer,
