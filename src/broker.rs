@@ -21,6 +21,13 @@ use tracing::{debug, info, warn};
 
 const BACKEND_EVENT_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Minimum interval between two consecutive requests sent to the player.
+/// Equivalent to a token bucket with capacity=1 and refill=1 per 100 ms:
+/// at most 10 requests/second, no burst. Mirrors the rate limit used by
+/// the .NET Oppo client and keeps a flood of client commands from
+/// overwhelming the player. The request channel (REQUEST_CHANNEL_CAP)
+/// is FIFO, matching the .NET `QueueProcessingOrder.OldestFirst`.
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A client command waiting for its backend response. `response_tx` is a
 /// per-request one-shot (bounded(1)) populated by the broker.
@@ -198,6 +205,22 @@ async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
     }
 }
 
+/// Sleeps just long enough that the next request is at least
+/// `MIN_REQUEST_INTERVAL` after the previous one, then stamps "now" as the
+/// new last-sent time. Called immediately before every backend write so the
+/// player sees at most one request per interval. The broker is briefly
+/// blocked during the sleep (≤ MIN_REQUEST_INTERVAL); backend events queue
+/// in their channel and are drained when the broker resumes.
+async fn await_rate_limit_and_mark(last_sent_at: &mut Option<Instant>) {
+    if let Some(t) = *last_sent_at {
+        let elapsed = t.elapsed();
+        if elapsed < MIN_REQUEST_INTERVAL {
+            Timer::after(MIN_REQUEST_INTERVAL - elapsed).await;
+        }
+    }
+    *last_sent_at = Some(Instant::now());
+}
+
 /// Waits for the next client request. `main` holds the original `request_tx`
 /// for the whole program lifetime, so `recv` cannot return `Err` here.
 async fn recv_request(requests: &Receiver<BackendRequest>) -> BrokerEvent {
@@ -234,6 +257,7 @@ pub async fn backend_broker(
     let mut in_flight: Option<(BackendRequest, Instant)> = None;
     let mut last_power_state: Option<u8> = None;
     let mut consecutive_timeouts: u32 = 0;
+    let mut last_request_sent_at: Option<Instant> = None;
 
     loop {
         let event = match (backend.as_ref(), in_flight.as_ref()) {
@@ -307,6 +331,7 @@ pub async fn backend_broker(
                     &mut backoff,
                     timeout,
                     &mut in_flight,
+                    &mut last_request_sent_at,
                 )
                 .await;
             }
@@ -440,6 +465,7 @@ async fn handle_new_request(
     backoff: &mut Backoff,
     timeout: Duration,
     in_flight: &mut Option<(BackendRequest, Instant)>,
+    last_request_sent_at: &mut Option<Instant>,
 ) {
     // See the function doc for why this exists. TL;DR: write-error retry is
     // bounded to one attempt per healthy→broken transition; later requests
@@ -448,6 +474,7 @@ async fn handle_new_request(
     let mut retry_after_write_fail = false;
 
     if let Some(conn) = backend.as_mut() {
+        await_rate_limit_and_mark(last_request_sent_at).await;
         match write_with_timeout(&mut conn.writer, &req.msg).await {
             Ok(()) => {
                 debug!(
@@ -481,6 +508,7 @@ async fn handle_new_request(
         return;
     };
 
+    await_rate_limit_and_mark(last_request_sent_at).await;
     match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
             debug!(
@@ -565,6 +593,46 @@ pub fn parse_max_consecutive_timeouts(raw: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_first_call_does_not_sleep_and_stamps_now() {
+        let mut last: Option<Instant> = None;
+        let start = Instant::now();
+        futures_lite::future::block_on(await_rate_limit_and_mark(&mut last));
+        assert!(
+            start.elapsed() < Duration::from_millis(20),
+            "first call should not sleep"
+        );
+        assert!(last.is_some(), "first call should stamp last_sent_at");
+    }
+
+    #[test]
+    fn rate_limit_sleeps_until_interval_elapsed() {
+        let mut last: Option<Instant> = Some(Instant::now());
+        let before = Instant::now();
+        futures_lite::future::block_on(await_rate_limit_and_mark(&mut last));
+        let elapsed = before.elapsed();
+        // Should have slept ~MIN_REQUEST_INTERVAL (small slack for scheduler).
+        assert!(
+            elapsed >= MIN_REQUEST_INTERVAL.saturating_sub(Duration::from_millis(10)),
+            "should have slept at least ~{MIN_REQUEST_INTERVAL:?}, slept {elapsed:?}"
+        );
+        assert!(
+            elapsed < MIN_REQUEST_INTERVAL + Duration::from_millis(50),
+            "should not have slept much beyond {MIN_REQUEST_INTERVAL:?}, slept {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_does_not_sleep_if_interval_already_passed() {
+        let mut last: Option<Instant> = Some(Instant::now() - MIN_REQUEST_INTERVAL * 2);
+        let start = Instant::now();
+        futures_lite::future::block_on(await_rate_limit_and_mark(&mut last));
+        assert!(
+            start.elapsed() < Duration::from_millis(20),
+            "should not sleep when interval already elapsed"
+        );
+    }
 
     #[test]
     fn timeout_policy_reconnects_after_streak_threshold() {
