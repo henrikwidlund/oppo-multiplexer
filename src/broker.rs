@@ -646,7 +646,8 @@ mod tests {
 
     #[test]
     fn rate_limit_remaining_zero_when_interval_already_passed() {
-        let long_ago = Instant::now() - MIN_REQUEST_INTERVAL * 2;
+        let now = Instant::now();
+        let long_ago = now.checked_sub(MIN_REQUEST_INTERVAL * 2).unwrap_or(now);
         assert_eq!(rate_limit_remaining(Some(long_ago)), Duration::ZERO);
     }
 
