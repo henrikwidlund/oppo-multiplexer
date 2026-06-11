@@ -511,13 +511,16 @@ async fn handle_new_request(
         // satisfied. Just stamp on success so the next pull's gate is correct.
         match write_with_timeout(&mut conn.writer, &req.msg).await {
             Ok(()) => {
-                slot.last_request_sent_at = Some(Instant::now());
+                // Single `now` for both the rate-limit stamp and the in-flight
+                // deadline so they share a consistent baseline.
+                let now = Instant::now();
+                slot.last_request_sent_at = Some(now);
                 debug!(
                     "[{} → backend] {}",
                     req.peer,
                     String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
                 );
-                slot.in_flight = Some((req, Instant::now() + timeout));
+                slot.in_flight = Some((req, now + timeout));
                 return;
             }
             Err(e) => {
@@ -555,13 +558,14 @@ async fn handle_new_request(
     // once BACKEND_EVENT_CAP fills.
     match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
-            slot.last_request_sent_at = Some(Instant::now());
+            let now = Instant::now();
+            slot.last_request_sent_at = Some(now);
             debug!(
                 "[{} → backend] {}",
                 req.peer,
                 String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
             );
-            slot.in_flight = Some((req, Instant::now() + timeout));
+            slot.in_flight = Some((req, now + timeout));
         }
         Err(e) => {
             slot.backend = None;
