@@ -21,12 +21,22 @@ use tracing::{debug, info, warn};
 
 const BACKEND_EVENT_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// Minimum interval between two consecutive requests sent to the player.
-/// Equivalent to a token bucket with capacity=1 and refill=1 per 100 ms:
-/// at most 10 requests/second, no burst. Mirrors the rate limit used by
-/// the .NET Oppo client and keeps a flood of client commands from
-/// overwhelming the player. The request channel (REQUEST_CHANNEL_CAP)
-/// is FIFO, matching the .NET `QueueProcessingOrder.OldestFirst`.
+/// Minimum interval between consecutive successful writes to the player
+/// in steady state (~10 req/s, no burst). Enforced by gating the broker's
+/// next request pull on `last_request_sent_at`; backend events keep flowing
+/// during the gate. Mirrors the rate limit used by the .NET Oppo client;
+/// the request channel (REQUEST_CHANNEL_CAP) is FIFO, matching the .NET
+/// `QueueProcessingOrder.OldestFirst`.
+///
+/// Carve-out: the reconnect-and-retry path in `handle_new_request` can
+/// issue a second write < MIN_REQUEST_INTERVAL after a failed primary
+/// write (the failed write may have partially landed before the kernel
+/// reported the error, per `write_with_timeout`). Bounded to at most one
+/// extra write per healthy→broken transition; documented here so the
+/// steady-state guarantee is honest about this edge case. Enforcing the
+/// gate on the retry path would force a broker-blocking sleep while a
+/// freshly-spawned `backend_reader` is running, risking dropped @U??
+/// updates once BACKEND_EVENT_CAP fills — a worse trade.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A client command waiting for its backend response. `response_tx` is a
