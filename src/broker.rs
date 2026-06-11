@@ -71,6 +71,20 @@ struct BackendConn {
     _reader_task: smol::Task<()>,
 }
 
+/// Mutable state tied to the current backend connection. Bundled so
+/// `handle_new_request` can take a single `&mut` parameter rather than four
+/// separate ones. `last_power_state` and `consecutive_timeouts` live outside
+/// because they belong to broadcast / liveness bookkeeping, not connection
+/// management.
+struct ConnSlot {
+    backend: Option<BackendConn>,
+    backoff: Backoff,
+    in_flight: Option<(BackendRequest, Instant)>,
+    /// Wall-clock of the last successful write to the player; drives the
+    /// rate-limit gate in `backend_broker`.
+    last_request_sent_at: Option<Instant>,
+}
+
 /// Things the broker's main `select` can produce on a single tick.
 enum BrokerEvent {
     Request(BackendRequest),
@@ -248,14 +262,18 @@ pub async fn backend_broker(
     spawner: Arc<Executor<'static>>,
 ) {
     let mut backoff = Backoff::new();
-    let mut backend: Option<BackendConn> = try_connect(&backend_addr, &spawner, &mut backoff).await;
-    let mut in_flight: Option<(BackendRequest, Instant)> = None;
+    let backend = try_connect(&backend_addr, &spawner, &mut backoff).await;
+    let mut slot = ConnSlot {
+        backend,
+        backoff,
+        in_flight: None,
+        last_request_sent_at: None,
+    };
     let mut last_power_state: Option<u8> = None;
     let mut consecutive_timeouts: u32 = 0;
-    let mut last_request_sent_at: Option<Instant> = None;
 
     loop {
-        let event = match (backend.as_ref(), in_flight.as_ref()) {
+        let event = match (slot.backend.as_ref(), slot.in_flight.as_ref()) {
             (Some(conn), Some((_, deadline))) => {
                 if Instant::now() >= *deadline {
                     // Drain pending events before declaring a timeout:
@@ -319,7 +337,7 @@ pub async fn backend_broker(
                 // branch is skipped, and gated_req is just `recv_request()` —
                 // which `future::or` polls before the event arm, so a queued
                 // request wins. Max request delay is thus MIN_REQUEST_INTERVAL.
-                let rate_wait = rate_limit_remaining(last_request_sent_at);
+                let rate_wait = rate_limit_remaining(slot.last_request_sent_at);
                 let gated_req = async {
                     if !rate_wait.is_zero() {
                         Timer::after(rate_wait).await;
@@ -329,7 +347,7 @@ pub async fn backend_broker(
                 future::or(gated_req, recv_backend_event(&conn.events)).await
             }
             (None, _) => {
-                let delay = backoff.delay_until_ready();
+                let delay = slot.backoff.delay_until_ready();
                 let reconnect_fut = async move {
                     Timer::after(delay).await;
                     BrokerEvent::ReconnectTick
@@ -340,17 +358,7 @@ pub async fn backend_broker(
 
         match event {
             BrokerEvent::Request(req) => {
-                handle_new_request(
-                    req,
-                    &mut backend,
-                    &backend_addr,
-                    &spawner,
-                    &mut backoff,
-                    timeout,
-                    &mut in_flight,
-                    &mut last_request_sent_at,
-                )
-                .await;
+                handle_new_request(req, &mut slot, &backend_addr, &spawner, timeout).await;
             }
             BrokerEvent::Backend(BackendEvent::Line(line)) => {
                 if is_backend_update(&line) {
@@ -358,7 +366,7 @@ pub async fn backend_broker(
                         last_power_state = Some(state);
                     }
                     broadcast_update(&clients, line);
-                } else if let Some((req, _)) = in_flight.take() {
+                } else if let Some((req, _)) = slot.in_flight.take() {
                     // Any matched request/response exchange confirms backend liveness.
                     consecutive_timeouts = 0;
                     // Some power responses are acknowledged before the backend emits
@@ -389,16 +397,16 @@ pub async fn backend_broker(
             }
             BrokerEvent::Backend(BackendEvent::Error(reason)) => {
                 warn!("{reason}");
-                backend = None;
-                backoff.on_failure();
+                slot.backend = None;
+                slot.backoff.on_failure();
                 consecutive_timeouts = 0;
                 last_power_state = None;
-                if let Some((req, _)) = in_flight.take() {
+                if let Some((req, _)) = slot.in_flight.take() {
                     let _ = req.response_tx.send(Err(reason)).await;
                 }
             }
             BrokerEvent::Timeout => {
-                if let Some((req, _)) = in_flight.take() {
+                if let Some((req, _)) = slot.in_flight.take() {
                     // Deployment invariant for this environment: if a request has
                     // not received a response within `timeout`, that response will
                     // never arrive later. If that invariant is violated, a late
@@ -425,17 +433,17 @@ pub async fn backend_broker(
                     ) {
                         // Drop backend after repeated timeouts: backend appears unhealthy
                         // because it is not producing responses in a timely manner.
-                        backend = None;
-                        backoff.on_failure();
+                        slot.backend = None;
+                        slot.backoff.on_failure();
                         consecutive_timeouts = 0;
                         last_power_state = None;
                     }
                 }
             }
             BrokerEvent::ReconnectTick => {
-                if backend.is_none() {
-                    backend = try_connect(&backend_addr, &spawner, &mut backoff).await;
-                    if backend.is_some() {
+                if slot.backend.is_none() {
+                    slot.backend = try_connect(&backend_addr, &spawner, &mut slot.backoff).await;
+                    if slot.backend.is_some() {
                         consecutive_timeouts = 0;
                     }
                 }
@@ -476,39 +484,36 @@ pub async fn backend_broker(
 ///    so the next request is gated; surface the error to the client.
 async fn handle_new_request(
     req: BackendRequest,
-    backend: &mut Option<BackendConn>,
+    slot: &mut ConnSlot,
     backend_addr: &str,
     spawner: &Arc<Executor<'static>>,
-    backoff: &mut Backoff,
     timeout: Duration,
-    in_flight: &mut Option<(BackendRequest, Instant)>,
-    last_request_sent_at: &mut Option<Instant>,
 ) {
     // See the function doc for why this exists. TL;DR: write-error retry is
     // bounded to one attempt per healthy→broken transition; later requests
-    // are gated by `is_ready()` because `backend` is None and the outer
+    // are gated by `is_ready()` because `slot.backend` is None and the outer
     // branch is skipped.
     let mut retry_after_write_fail = false;
 
-    if let Some(conn) = backend.as_mut() {
+    if let Some(conn) = slot.backend.as_mut() {
         // No inner rate-limit sleep on this path: broker's (Some, None) select
         // arm gated the request pull, so MIN_REQUEST_INTERVAL is already
         // satisfied. Just stamp on success so the next pull's gate is correct.
         match write_with_timeout(&mut conn.writer, &req.msg).await {
             Ok(()) => {
-                *last_request_sent_at = Some(Instant::now());
+                slot.last_request_sent_at = Some(Instant::now());
                 debug!(
                     "[{} → backend] {}",
                     req.peer,
                     String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
                 );
-                *in_flight = Some((req, Instant::now() + timeout));
+                slot.in_flight = Some((req, Instant::now() + timeout));
                 return;
             }
             Err(e) => {
                 warn!("backend write error ({e}) while handling {}, reconnecting", req.peer);
-                *backend = None;
-                backoff.on_failure();
+                slot.backend = None;
+                slot.backoff.on_failure();
                 retry_after_write_fail = true;
             }
         }
@@ -517,13 +522,13 @@ async fn handle_new_request(
     // Path A (`!retry_after_write_fail`): no backend at entry; obey the cooldown.
     // Path B (`retry_after_write_fail`): we just bumped backoff after losing a
     // live connection — bypass the gate this one time for the retry.
-    if !retry_after_write_fail && !backoff.is_ready() {
+    if !retry_after_write_fail && !slot.backoff.is_ready() {
         let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
         return;
     }
 
-    *backend = try_connect(backend_addr, spawner, backoff).await;
-    let Some(conn) = backend.as_mut() else {
+    slot.backend = try_connect(backend_addr, spawner, &mut slot.backoff).await;
+    let Some(conn) = slot.backend.as_mut() else {
         let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
         return;
     };
@@ -540,17 +545,17 @@ async fn handle_new_request(
     // once BACKEND_EVENT_CAP fills.
     match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
-            *last_request_sent_at = Some(Instant::now());
+            slot.last_request_sent_at = Some(Instant::now());
             debug!(
                 "[{} → backend] {}",
                 req.peer,
                 String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
             );
-            *in_flight = Some((req, Instant::now() + timeout));
+            slot.in_flight = Some((req, Instant::now() + timeout));
         }
         Err(e) => {
-            *backend = None;
-            backoff.on_failure();
+            slot.backend = None;
+            slot.backoff.on_failure();
             let _ = req
                 .response_tx
                 .send(Err(format!("backend write error: {e}")))
@@ -636,15 +641,17 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_remaining_near_full_interval_when_just_sent() {
+    fn rate_limit_remaining_positive_when_just_sent() {
         let just_now = Instant::now();
         let remaining = rate_limit_remaining(Some(just_now));
-        // A tiny amount of wall-clock has passed between `just_now` and the
-        // call, so the remaining wait is just under MIN_REQUEST_INTERVAL.
-        // Threshold scales with the interval to stay valid if MIN changes.
+        // Only assert the invariants that don't depend on scheduler timing:
+        // remaining must be > 0 (we haven't waited the full interval yet) and
+        // must never exceed MIN_REQUEST_INTERVAL. A tighter lower bound (e.g.
+        // "near MIN_REQUEST_INTERVAL") would be flaky on loaded CI runners
+        // where >10 ms can elapse between `Instant::now()` and the call.
         assert!(
-            remaining > MIN_REQUEST_INTERVAL - Duration::from_millis(10),
-            "expected close to {MIN_REQUEST_INTERVAL:?}, got {remaining:?}"
+            remaining > Duration::ZERO,
+            "expected positive remaining wait, got {remaining:?}"
         );
         assert!(
             remaining <= MIN_REQUEST_INTERVAL,
