@@ -205,28 +205,15 @@ async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
     }
 }
 
-/// Sleeps just long enough that the next request is at least
-/// `MIN_REQUEST_INTERVAL` after the previous one, then stamps "now" as the
-/// new last-sent time.
-///
-/// Used on the reconnect / inner-write retry path inside `handle_new_request`,
-/// where a request might otherwise be written without going through the
-/// broker loop's rate-gated request pull. The primary write path (broker in
-/// `(Some, None)` state) is gated by the broker's select arm instead and
-/// does NOT call this helper — it stamps `last_request_sent_at` directly
-/// after a successful write.
-///
-/// The broker is briefly blocked during the sleep (≤ MIN_REQUEST_INTERVAL);
-/// on the retry path there is no live backend reader during the wait, so no
-/// events are dropped.
-async fn await_rate_limit_and_mark(last_sent_at: &mut Option<Instant>) {
-    if let Some(t) = *last_sent_at {
-        let elapsed = t.elapsed();
-        if elapsed < MIN_REQUEST_INTERVAL {
-            Timer::after(MIN_REQUEST_INTERVAL - elapsed).await;
-        }
+/// Remaining wait until a new request may be sent to the player. Used by the
+/// broker's main-loop request-pull gate; the gate runs concurrently with the
+/// backend-event arm so rate-limiting commands → player never blocks player
+/// → clients.
+fn rate_limit_remaining(last_sent_at: Option<Instant>) -> Duration {
+    match last_sent_at {
+        Some(t) => MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed()),
+        None => Duration::ZERO,
     }
-    *last_sent_at = Some(Instant::now());
 }
 
 /// Waits for the next client request. `main` holds the original `request_tx`
@@ -332,10 +319,7 @@ pub async fn backend_broker(
                 // branch is skipped, and gated_req is just `recv_request()` —
                 // which `future::or` polls before the event arm, so a queued
                 // request wins. Max request delay is thus MIN_REQUEST_INTERVAL.
-                let rate_wait = match last_request_sent_at {
-                    Some(t) => MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed()),
-                    None => Duration::ZERO,
-                };
+                let rate_wait = rate_limit_remaining(last_request_sent_at);
                 let gated_req = async {
                     if !rate_wait.is_zero() {
                         Timer::after(rate_wait).await;
@@ -544,9 +528,19 @@ async fn handle_new_request(
         return;
     };
 
-    await_rate_limit_and_mark(last_request_sent_at).await;
+    // No rate-limit sleep here. The 100 ms minimum is already preserved:
+    // either the broker's main-loop gate held the request until at least
+    // MIN_REQUEST_INTERVAL had passed since the previous successful write,
+    // or there has been no successful write yet (last_request_sent_at is
+    // None). The retry path then adds time on top (failed-write detection +
+    // a real TCP handshake inside try_connect — never zero), so the
+    // spacing from the previous successful write is always ≥
+    // MIN_REQUEST_INTERVAL. Sleeping here would block the broker while the
+    // new backend_reader is already running, risking dropped @U?? updates
+    // once BACKEND_EVENT_CAP fills.
     match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
+            *last_request_sent_at = Some(Instant::now());
             debug!(
                 "[{} → backend] {}",
                 req.peer,
@@ -630,54 +624,31 @@ pub fn parse_max_consecutive_timeouts(raw: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    // These tests use `smol::block_on` (not `futures_lite::future::block_on`)
-    // because `smol::Timer` requires the async-io reactor to be driven for the
-    // timer to fire. `smol::block_on` integrates the reactor; the bare
-    // `futures_lite` block_on does not, and these tests would hang on systems
-    // where the global parker thread does not happen to wake the timer.
-
     #[test]
-    fn rate_limit_first_call_does_not_sleep_and_stamps_now() {
-        let mut last: Option<Instant> = None;
-        let start = Instant::now();
-        smol::block_on(await_rate_limit_and_mark(&mut last));
-        // Threshold is relative to MIN_REQUEST_INTERVAL so it scales if the
-        // interval is ever changed. Half-interval is well under "intentional
-        // sleep" and still tolerates CI scheduler jitter.
-        assert!(
-            start.elapsed() < MIN_REQUEST_INTERVAL / 2,
-            "first call should not sleep"
-        );
-        assert!(last.is_some(), "first call should stamp last_sent_at");
+    fn rate_limit_remaining_none_when_never_sent() {
+        assert_eq!(rate_limit_remaining(None), Duration::ZERO);
     }
 
     #[test]
-    fn rate_limit_sleeps_until_interval_elapsed() {
-        let mut last: Option<Instant> = Some(Instant::now());
-        let before = Instant::now();
-        smol::block_on(await_rate_limit_and_mark(&mut last));
-        let elapsed = before.elapsed();
-        // Should have slept ~MIN_REQUEST_INTERVAL. Generous upper bound for
-        // loaded CI runners; the goal is to confirm we slept ROUGHLY one
-        // interval, not to enforce a precise scheduler deadline.
-        assert!(
-            elapsed >= MIN_REQUEST_INTERVAL.saturating_sub(Duration::from_millis(10)),
-            "should have slept at least ~{MIN_REQUEST_INTERVAL:?}, slept {elapsed:?}"
-        );
-        assert!(
-            elapsed < MIN_REQUEST_INTERVAL + Duration::from_millis(500),
-            "should not have slept much beyond {MIN_REQUEST_INTERVAL:?}, slept {elapsed:?}"
-        );
+    fn rate_limit_remaining_zero_when_interval_already_passed() {
+        let long_ago = Instant::now() - MIN_REQUEST_INTERVAL * 2;
+        assert_eq!(rate_limit_remaining(Some(long_ago)), Duration::ZERO);
     }
 
     #[test]
-    fn rate_limit_does_not_sleep_if_interval_already_passed() {
-        let mut last: Option<Instant> = Some(Instant::now() - MIN_REQUEST_INTERVAL * 2);
-        let start = Instant::now();
-        smol::block_on(await_rate_limit_and_mark(&mut last));
+    fn rate_limit_remaining_near_full_interval_when_just_sent() {
+        let just_now = Instant::now();
+        let remaining = rate_limit_remaining(Some(just_now));
+        // A tiny amount of wall-clock has passed between `just_now` and the
+        // call, so the remaining wait is just under MIN_REQUEST_INTERVAL.
+        // Threshold scales with the interval to stay valid if MIN changes.
         assert!(
-            start.elapsed() < MIN_REQUEST_INTERVAL / 2,
-            "should not sleep when interval already elapsed"
+            remaining > MIN_REQUEST_INTERVAL - Duration::from_millis(10),
+            "expected close to {MIN_REQUEST_INTERVAL:?}, got {remaining:?}"
+        );
+        assert!(
+            remaining <= MIN_REQUEST_INTERVAL,
+            "remaining {remaining:?} must not exceed {MIN_REQUEST_INTERVAL:?}"
         );
     }
 
