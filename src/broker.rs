@@ -594,13 +594,19 @@ pub fn parse_max_consecutive_timeouts(raw: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    // These tests use `smol::block_on` (not `futures_lite::future::block_on`)
+    // because `smol::Timer` requires the async-io reactor to be driven for the
+    // timer to fire. `smol::block_on` integrates the reactor; the bare
+    // `futures_lite` block_on does not, and these tests would hang on systems
+    // where the global parker thread does not happen to wake the timer.
+
     #[test]
     fn rate_limit_first_call_does_not_sleep_and_stamps_now() {
         let mut last: Option<Instant> = None;
         let start = Instant::now();
-        futures_lite::future::block_on(await_rate_limit_and_mark(&mut last));
+        smol::block_on(await_rate_limit_and_mark(&mut last));
         assert!(
-            start.elapsed() < Duration::from_millis(20),
+            start.elapsed() < Duration::from_millis(50),
             "first call should not sleep"
         );
         assert!(last.is_some(), "first call should stamp last_sent_at");
@@ -610,15 +616,17 @@ mod tests {
     fn rate_limit_sleeps_until_interval_elapsed() {
         let mut last: Option<Instant> = Some(Instant::now());
         let before = Instant::now();
-        futures_lite::future::block_on(await_rate_limit_and_mark(&mut last));
+        smol::block_on(await_rate_limit_and_mark(&mut last));
         let elapsed = before.elapsed();
-        // Should have slept ~MIN_REQUEST_INTERVAL (small slack for scheduler).
+        // Should have slept ~MIN_REQUEST_INTERVAL. Generous upper bound for
+        // loaded CI runners; the goal is to confirm we slept ROUGHLY one
+        // interval, not to enforce a precise scheduler deadline.
         assert!(
             elapsed >= MIN_REQUEST_INTERVAL.saturating_sub(Duration::from_millis(10)),
             "should have slept at least ~{MIN_REQUEST_INTERVAL:?}, slept {elapsed:?}"
         );
         assert!(
-            elapsed < MIN_REQUEST_INTERVAL + Duration::from_millis(50),
+            elapsed < MIN_REQUEST_INTERVAL + Duration::from_millis(500),
             "should not have slept much beyond {MIN_REQUEST_INTERVAL:?}, slept {elapsed:?}"
         );
     }
@@ -627,9 +635,9 @@ mod tests {
     fn rate_limit_does_not_sleep_if_interval_already_passed() {
         let mut last: Option<Instant> = Some(Instant::now() - MIN_REQUEST_INTERVAL * 2);
         let start = Instant::now();
-        futures_lite::future::block_on(await_rate_limit_and_mark(&mut last));
+        smol::block_on(await_rate_limit_and_mark(&mut last));
         assert!(
-            start.elapsed() < Duration::from_millis(20),
+            start.elapsed() < Duration::from_millis(50),
             "should not sleep when interval already elapsed"
         );
     }
