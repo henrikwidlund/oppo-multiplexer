@@ -207,10 +207,18 @@ async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
 
 /// Sleeps just long enough that the next request is at least
 /// `MIN_REQUEST_INTERVAL` after the previous one, then stamps "now" as the
-/// new last-sent time. Called immediately before every backend write so the
-/// player sees at most one request per interval. The broker is briefly
-/// blocked during the sleep (≤ MIN_REQUEST_INTERVAL); backend events queue
-/// in their channel and are drained when the broker resumes.
+/// new last-sent time.
+///
+/// Used on the reconnect / inner-write retry path inside `handle_new_request`,
+/// where a request might otherwise be written without going through the
+/// broker loop's rate-gated request pull. The primary write path (broker in
+/// `(Some, None)` state) is gated by the broker's select arm instead and
+/// does NOT call this helper — it stamps `last_request_sent_at` directly
+/// after a successful write.
+///
+/// The broker is briefly blocked during the sleep (≤ MIN_REQUEST_INTERVAL);
+/// on the retry path there is no live backend reader during the wait, so no
+/// events are dropped.
 async fn await_rate_limit_and_mark(last_sent_at: &mut Option<Instant>) {
     if let Some(t) = *last_sent_at {
         let elapsed = t.elapsed();
