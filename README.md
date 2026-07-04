@@ -29,6 +29,54 @@ Example:
 oppo-multiplexer 23 192.168.1.50:23 10 5
 ```
 
+### Docker
+
+A prebuilt multi-arch image (`linux/amd64`, `linux/arm64`) is published to Docker Hub as
+[`henrikwidlund/oppo-multiplexer`](https://hub.docker.com/r/henrikwidlund/oppo-multiplexer)
+on each `v*.*.*` tag. It is a static `scratch` image that runs as a non-root user.
+
+> **Ports below 1024:** the container runs as a non-root user (UID `65532`), which
+> cannot bind privileged ports *inside* the container. Have the app listen on a high
+> port (e.g. `1024`) and use Docker's port mapping to expose it on a low host port if needed —
+> e.g. `-p 23:1024` with `command` listening on `1024`. The `listen_port` argument is
+> the **container** port, and the left side of `-p host:container` is what clients connect to.
+
+Arguments are passed the same way as the binary:
+
+```shell
+docker run --rm -p 23:1024 henrikwidlund/oppo-multiplexer \
+  1024 192.168.1.50:23 10 5
+```
+
+Run detached:
+
+```shell
+docker run -d --name oppo -p 23:1024 --restart unless-stopped \
+  henrikwidlund/oppo-multiplexer 1024 192.168.1.50:23 10 5
+```
+
+Or with Docker Compose:
+
+```yaml
+services:
+  oppo-multiplexer:
+    image: henrikwidlund/oppo-multiplexer
+    ports: ["23:1024"]
+    command: ["1024", "192.168.1.50:23", "10", "5"]
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info
+```
+
+Logs go to stderr (journald is not available in the container).
+
+#### Building the image locally
+
+```shell
+docker build -t oppo-multiplexer:local .
+docker run --rm -p 23:1024 oppo-multiplexer:local 1024 192.168.1.50:23 10 5
+```
+
 ### Installing on Linux
 
 Download `install_linux.sh` and follow the instructions. If you want to run on ports below 1024,
