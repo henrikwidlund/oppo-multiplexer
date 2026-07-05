@@ -1,5 +1,62 @@
 use std::sync::{Arc, LazyLock};
 
+/// Which player-family control protocol a proxy instance speaks. One instance
+/// serves one player, so this is fixed for the process lifetime (chosen via
+/// `--protocol`). It governs the client-command line terminator and whether the
+/// player answers commands at all.
+///
+/// - `Udp20x` (default): the UDP-203/205 IP protocol — `#CODE\r` commands,
+///   `\r`-terminated `@...` responses, and `@U??` unsolicited updates.
+/// - `Magnetar`: the Magnetar network protocol — `#CODE\r\n` commands, and the
+///   player sends **no** response and **no** updates (fire-and-forget). The
+///   proxy still multiplexes it because Magnetar allows only one control
+///   connection, same as the Oppo players.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    Udp20x,
+    Magnetar,
+}
+
+impl Protocol {
+    /// Byte that terminates one command line arriving from a client. Oppo
+    /// UDP-20X frames end in `\r`; Magnetar frames end in `\r\n`, so we delimit
+    /// on the trailing `\n` and forward the whole frame verbatim.
+    pub fn client_delim(self) -> u8 {
+        match self {
+            Protocol::Udp20x => b'\r',
+            Protocol::Magnetar => b'\n',
+        }
+    }
+
+    /// True when the player never answers a command on the wire, so the proxy
+    /// must ack the client immediately instead of waiting for (and timing out
+    /// on) a response that will never come.
+    pub fn is_fire_and_forget(self) -> bool {
+        matches!(self, Protocol::Magnetar)
+    }
+
+    /// Bytes that terminate a line the proxy writes back to a client (currently
+    /// only the `ERROR: …` notice). Matches the family's framing so the client's
+    /// own line delimiter (see `client_delim`) sees a complete line: `\r` for
+    /// UDP-20X, `\r\n` for Magnetar.
+    pub fn response_terminator(self) -> &'static [u8] {
+        match self {
+            Protocol::Udp20x => b"\r",
+            Protocol::Magnetar => b"\r\n",
+        }
+    }
+
+    /// Parses the `--protocol` value. Returns `None` for unknown modes so the
+    /// caller can print a usage error.
+    pub fn parse(raw: &str) -> Option<Protocol> {
+        match raw {
+            "udp20x" => Some(Protocol::Udp20x),
+            "magnetar" => Some(Protocol::Magnetar),
+            _ => None,
+        }
+    }
+}
+
 const UPDATE_PREFIXES: [&[u8]; 11] = [
     b"@UPW ",
     b"@UPL ",
@@ -51,6 +108,23 @@ pub fn synthetic_power_state_from_exchange(request: &[u8], response: &[u8]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_parses_known_modes_and_rejects_others() {
+        assert_eq!(Protocol::parse("udp20x"), Some(Protocol::Udp20x));
+        assert_eq!(Protocol::parse("magnetar"), Some(Protocol::Magnetar));
+        assert_eq!(Protocol::parse("UDP20X"), None);
+        assert_eq!(Protocol::parse("pre20x"), None);
+        assert_eq!(Protocol::parse(""), None);
+    }
+
+    #[test]
+    fn protocol_delim_and_fire_and_forget_match_family() {
+        assert_eq!(Protocol::Udp20x.client_delim(), b'\r');
+        assert_eq!(Protocol::Magnetar.client_delim(), b'\n');
+        assert!(!Protocol::Udp20x.is_fire_and_forget());
+        assert!(Protocol::Magnetar.is_fire_and_forget());
+    }
 
     #[test]
     fn is_backend_update_matches_all_prefixes() {

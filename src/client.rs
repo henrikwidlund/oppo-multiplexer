@@ -1,5 +1,6 @@
 use crate::broker::{BackendRequest, Clients, lock_clients};
 use crate::io_util::{MAX_LINE_LEN, read_until_capped};
+use crate::protocol::Protocol;
 
 use smol::{
     Executor,
@@ -45,8 +46,12 @@ pub async fn handle_client(
     request_tx: Sender<BackendRequest>,
     clients: Clients,
     spawner: Arc<Executor<'static>>,
+    protocol: Protocol,
     _slot: ClientSlotGuard,
 ) {
+    // Line terminator the client uses (see Protocol::client_delim): `\r` for
+    // UDP-20X, `\n` for Magnetar's `\r\n`-framed commands.
+    let delim = protocol.client_delim();
     let peer: Arc<str> = stream
         .peer_addr()
         .ok()
@@ -87,15 +92,15 @@ pub async fn handle_client(
     loop {
         msg.clear();
 
-        // Disconnect on read error or any line not terminated by `\r` (clean
+        // Disconnect on read error or any line not terminated by `delim` (clean
         // EOF and EOF mid-line both leave the buffer without the terminator).
         // Forwarding a truncated command could make the player execute a
         // partial command. `read_until_capped` also enforces MAX_LINE_LEN, so
-        // a client that never sends `\r` cannot grow `msg` without bound.
-        if read_until_capped(&mut client, b'\r', &mut msg, MAX_LINE_LEN)
+        // a client that never sends `delim` cannot grow `msg` without bound.
+        if read_until_capped(&mut client, delim, &mut msg, MAX_LINE_LEN)
             .await
             .is_err()
-            || msg.last() != Some(&b'\r')
+            || msg.last() != Some(&delim)
         {
             break;
         }
@@ -122,7 +127,14 @@ pub async fn handle_client(
 
         let payload: Arc<[u8]> = match result {
             Ok(response) => Arc::from(response),
-            Err(reason) => Arc::from(format!("ERROR: {reason}\r").into_bytes()),
+            Err(reason) => {
+                // Terminate the error line with the client's own framing so its
+                // line delimiter sees a complete line (`\r` for UDP-20X,
+                // `\r\n` for Magnetar) — not a hardcoded `\r`.
+                let mut line = format!("ERROR: {reason}").into_bytes();
+                line.extend_from_slice(protocol.response_terminator());
+                Arc::from(line)
+            }
         };
         if out_tx.send(payload).await.is_err() {
             break;

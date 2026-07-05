@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 
 use crate::broker::{BackendRequest, Clients, backend_broker, parse_max_consecutive_timeouts};
 use crate::client::{ClientSlotGuard, handle_client};
+use crate::protocol::Protocol;
 
 const REQUEST_CHANNEL_CAP: usize = 32;
 const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
@@ -62,13 +63,53 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Extracts the optional `--protocol <mode>` / `--protocol=<mode>` flag from
+/// argv, returning the selected `Protocol` (defaulting to `Udp20x`) and the
+/// remaining arguments — including `argv[0]` — with the flag removed so the
+/// positional parsing that follows is unaffected by flag position. Exits with a
+/// usage error on a missing or unknown mode.
+fn extract_protocol_flag(raw: &[String]) -> (Protocol, Vec<String>) {
+    let mut protocol = Protocol::Udp20x;
+    let mut rest = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
+        let value = if let Some(v) = arg.strip_prefix("--protocol=") {
+            Some(v.to_string())
+        } else if arg == "--protocol" {
+            i += 1;
+            Some(raw.get(i).cloned().unwrap_or_else(|| {
+                eprintln!("--protocol requires a value (udp20x|magnetar)");
+                std::process::exit(1);
+            }))
+        } else {
+            None
+        };
+        match value {
+            Some(v) => {
+                protocol = Protocol::parse(&v).unwrap_or_else(|| {
+                    eprintln!("Invalid --protocol: '{v}' (expected udp20x or magnetar)");
+                    std::process::exit(1);
+                });
+            }
+            None => rest.push(arg.clone()),
+        }
+        i += 1;
+    }
+    (protocol, rest)
+}
+
 fn main() {
     init_logging();
 
-    let args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<String> = std::env::args().collect();
+    // Pull the optional `--protocol <mode>` / `--protocol=<mode>` flag out of
+    // argv before the positional parsing below, so it can appear anywhere and
+    // the existing positional contract is unchanged. Defaults to udp20x.
+    let (protocol, args) = extract_protocol_flag(&raw_args);
     if !matches!(args.len(), 4 | 5) {
         eprintln!(
-            "Usage: {} <listen_port> <backend_host:backend_port> <timeout_seconds> [max_consecutive_timeouts]",
+            "Usage: {} <listen_port> <backend_host:backend_port> <timeout_seconds> [max_consecutive_timeouts] [--protocol udp20x|magnetar]",
             args[0]
         );
         std::process::exit(1);
@@ -121,6 +162,7 @@ fn main() {
                 Arc::clone(&backend_addr),
                 timeout,
                 max_consecutive_timeouts,
+                protocol,
                 Arc::clone(&spawner),
             ))
             .detach();
@@ -128,7 +170,7 @@ fn main() {
         let listener = TcpListener::bind(format!("0.0.0.0:{listen_port}"))
             .await
             .expect("failed to bind listen port");
-        info!("listening on 0.0.0.0:{listen_port}, backend {backend_addr}");
+        info!("listening on 0.0.0.0:{listen_port}, backend {backend_addr}, protocol {protocol:?}");
 
         let mut next_client_id = 1_u64;
 
@@ -162,6 +204,7 @@ fn main() {
                             request_tx.clone(),
                             Arc::clone(&clients),
                             Arc::clone(&spawner),
+                            protocol,
                             slot,
                         ))
                         .detach();

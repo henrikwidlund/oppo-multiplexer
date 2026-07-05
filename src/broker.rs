@@ -1,7 +1,7 @@
 use crate::backoff::Backoff;
 use crate::io_util::{MAX_LINE_LEN, read_until_capped, write_with_timeout};
 use crate::protocol::{
-    SYNTHETIC_UPW_OFF, SYNTHETIC_UPW_ON, is_backend_update, parse_upw_state,
+    Protocol, SYNTHETIC_UPW_OFF, SYNTHETIC_UPW_ON, is_backend_update, parse_upw_state,
     synthetic_power_state_from_exchange,
 };
 
@@ -9,7 +9,7 @@ use futures_lite::future;
 use smol::{
     Executor, Timer,
     channel::{self, Receiver, Sender, TrySendError},
-    io::BufReader,
+    io::{AsyncReadExt, BufReader},
     net::TcpStream,
 };
 use std::{
@@ -113,6 +113,7 @@ async fn try_connect(
     addr: &str,
     spawner: &Arc<Executor<'static>>,
     backoff: &mut Backoff,
+    protocol: Protocol,
 ) -> Option<BackendConn> {
     let result = future::or(
         async { TcpStream::connect(addr).await.map_err(|e| e.to_string()) },
@@ -132,7 +133,12 @@ async fn try_connect(
             info!("connected to backend at {addr}");
             let writer = stream.clone();
             let (events_tx, events_rx) = channel::bounded::<BackendEvent>(BACKEND_EVENT_CAP);
-            let reader_task = spawner.spawn(backend_reader(stream, events_tx));
+            // Magnetar sends no responses or updates, so its reader only exists
+            // to notice a dropped connection; everything else parses `\r` lines.
+            let reader_task = match protocol {
+                Protocol::Magnetar => spawner.spawn(magnetar_backend_reader(stream, events_tx)),
+                Protocol::Udp20x => spawner.spawn(backend_reader(stream, events_tx)),
+            };
             backoff.on_success();
             Some(BackendConn {
                 writer,
@@ -216,6 +222,32 @@ async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     }
 }
 
+/// Reader for the Magnetar backend: the player is fire-and-forget and emits
+/// neither command responses nor unsolicited updates, so any bytes it does send
+/// are drained and discarded. The task exists only to surface a dropped
+/// connection (EOF / read error) as a `BackendEvent::Error`, matching how
+/// `backend_reader` reports the same conditions.
+async fn magnetar_backend_reader(mut stream: TcpStream, tx: Sender<BackendEvent>) {
+    let mut scratch = [0u8; 256];
+    loop {
+        match stream.read(&mut scratch).await {
+            Ok(0) => {
+                let _ = tx
+                    .send(BackendEvent::Error("backend closed connection".to_string()))
+                    .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = tx
+                    .send(BackendEvent::Error(format!("backend read error: {e}")))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
 /// Waits for the next event from the backend reader task. If the reader has
 /// already exited (channel closed), returns a manufactured `BackendEvent::Error`
 /// so the broker's existing "backend died" handling runs — no extra match arm
@@ -269,10 +301,11 @@ pub async fn backend_broker(
     backend_addr: Arc<str>,
     timeout: Duration,
     max_consecutive_timeouts: u32,
+    protocol: Protocol,
     spawner: Arc<Executor<'static>>,
 ) {
     let mut backoff = Backoff::new();
-    let backend = try_connect(&backend_addr, &spawner, &mut backoff).await;
+    let backend = try_connect(&backend_addr, &spawner, &mut backoff, protocol).await;
     let mut slot = ConnSlot {
         backend,
         backoff,
@@ -368,7 +401,7 @@ pub async fn backend_broker(
 
         match event {
             BrokerEvent::Request(req) => {
-                handle_new_request(req, &mut slot, &backend_addr, &spawner, timeout).await;
+                handle_new_request(req, &mut slot, &backend_addr, &spawner, protocol, timeout).await;
             }
             BrokerEvent::Backend(BackendEvent::Line(line)) => {
                 if is_backend_update(&line) {
@@ -452,13 +485,50 @@ pub async fn backend_broker(
             }
             BrokerEvent::ReconnectTick => {
                 if slot.backend.is_none() {
-                    slot.backend = try_connect(&backend_addr, &spawner, &mut slot.backoff).await;
+                    slot.backend =
+                        try_connect(&backend_addr, &spawner, &mut slot.backoff, protocol).await;
                     if slot.backend.is_some() {
                         consecutive_timeouts = 0;
                     }
                 }
             }
         }
+    }
+}
+
+/// Records the outcome of a successful write to the player.
+///
+/// For fire-and-forget protocols (Magnetar) the player never answers, so we
+/// ack the client immediately with an empty payload — `handle_client` writes
+/// nothing back — and keep no in-flight state. For request/response protocols
+/// the request becomes the in-flight request and its response is awaited on the
+/// broker's main loop.
+///
+/// Liveness caveat (Magnetar): with no in-flight request there is no response
+/// timeout, so the timeout-driven reconnect (`max_consecutive_timeouts`) never
+/// engages. A half-open backend that stops accepting data without sending a
+/// FIN/RST is therefore undetectable at the application layer — the player
+/// emits no responses to time out on, and small low-rate writes keep succeeding
+/// into the kernel buffer. Genuine socket death is  still surfaced by
+/// `magnetar_backend_reader` on EOF/RST. OS-level TCP  keepalive would be the
+/// only way to catch a silent black-hole.
+async fn after_successful_write(
+    req: BackendRequest,
+    slot: &mut ConnSlot,
+    protocol: Protocol,
+    now: Instant,
+    timeout: Duration,
+) {
+    slot.last_request_sent_at = Some(now);
+    debug!(
+        "[{} → backend] {}",
+        req.peer,
+        String::from_utf8_lossy(&req.msg).trim_end_matches(['\r', '\n'])
+    );
+    if protocol.is_fire_and_forget() {
+        let _ = req.response_tx.send(Ok(Vec::new())).await;
+    } else {
+        slot.in_flight = Some((req, now + timeout));
     }
 }
 
@@ -497,6 +567,7 @@ async fn handle_new_request(
     slot: &mut ConnSlot,
     backend_addr: &str,
     spawner: &Arc<Executor<'static>>,
+    protocol: Protocol,
     timeout: Duration,
 ) {
     // See the function doc for why this exists. TL;DR: write-error retry is
@@ -514,13 +585,7 @@ async fn handle_new_request(
                 // Single `now` for both the rate-limit stamp and the in-flight
                 // deadline so they share a consistent baseline.
                 let now = Instant::now();
-                slot.last_request_sent_at = Some(now);
-                debug!(
-                    "[{} → backend] {}",
-                    req.peer,
-                    String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
-                );
-                slot.in_flight = Some((req, now + timeout));
+                after_successful_write(req, slot, protocol, now, timeout).await;
                 return;
             }
             Err(e) => {
@@ -540,7 +605,7 @@ async fn handle_new_request(
         return;
     }
 
-    slot.backend = try_connect(backend_addr, spawner, &mut slot.backoff).await;
+    slot.backend = try_connect(backend_addr, spawner, &mut slot.backoff, protocol).await;
     let Some(conn) = slot.backend.as_mut() else {
         let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
         return;
@@ -558,13 +623,7 @@ async fn handle_new_request(
     match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
             let now = Instant::now();
-            slot.last_request_sent_at = Some(now);
-            debug!(
-                "[{} → backend] {}",
-                req.peer,
-                String::from_utf8_lossy(&req.msg).trim_end_matches('\r')
-            );
-            slot.in_flight = Some((req, now + timeout));
+            after_successful_write(req, slot, protocol, now, timeout).await;
         }
         Err(e) => {
             slot.backend = None;

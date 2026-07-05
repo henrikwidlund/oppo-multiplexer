@@ -93,14 +93,27 @@ esac
 read -r -p "Release tag to install (default latest): " RELEASE_TAG
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 
-read -r -p "Oppo IP/host (example 192.168.1.50): " OPPO_HOST
+read -r -p "Player IP/host (example 192.168.1.50): " OPPO_HOST
 if [[ -z "${OPPO_HOST}" ]]; then
-  echo "Oppo IP/host cannot be empty."
+  echo "Player IP/host cannot be empty."
   exit 1
 fi
 
-read -r -p "Oppo port (default 23): " OPPO_PORT
-OPPO_PORT="${OPPO_PORT:-23}"
+read -r -p "Protocol (udp20x/magnetar, default udp20x): " PROTOCOL
+PROTOCOL="${PROTOCOL:-udp20x}"
+if [[ "${PROTOCOL}" != "udp20x" && "${PROTOCOL}" != "magnetar" ]]; then
+  echo "Invalid protocol: ${PROTOCOL} (expected udp20x or magnetar)"
+  exit 1
+fi
+
+# UDP-20X players listen on port 23; Magnetar players on 8102.
+if [[ "${PROTOCOL}" == "magnetar" ]]; then
+  DEFAULT_OPPO_PORT=8102
+else
+  DEFAULT_OPPO_PORT=23
+fi
+read -r -p "Player port (default ${DEFAULT_OPPO_PORT}): " OPPO_PORT
+OPPO_PORT="${OPPO_PORT:-${DEFAULT_OPPO_PORT}}"
 
 read -r -p "Listen port for oppo-multiplexer: " LISTEN_PORT
 
@@ -111,7 +124,7 @@ read -r -p "Max consecutive timed-out requests before reconnect (default 3): " M
 MAX_CONSECUTIVE_TIMEOUTS="${MAX_CONSECUTIVE_TIMEOUTS:-3}"
 
 if ! [[ "${OPPO_PORT}" =~ ^[0-9]+$ ]] || (( OPPO_PORT < 1 || OPPO_PORT > 65535 )); then
-  echo "Invalid Oppo port: ${OPPO_PORT}"
+  echo "Invalid Player port: ${OPPO_PORT}"
   exit 1
 fi
 if ! [[ "${LISTEN_PORT}" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 65535 )); then
@@ -178,6 +191,7 @@ OPPO_PORT=${OPPO_PORT}
 LISTEN_PORT=${LISTEN_PORT}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS}
 MAX_CONSECUTIVE_TIMEOUTS=${MAX_CONSECUTIVE_TIMEOUTS}
+PROTOCOL=${PROTOCOL}
 RUST_LOG=info
 EOCFG
 chown "root:${ENV_GROUP}" "${ENV_FILE}"
@@ -193,7 +207,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=${ENV_FILE}
-ExecStart=${BIN_PATH} \${LISTEN_PORT} \${OPPO_HOST}:\${OPPO_PORT} \${TIMEOUT_SECONDS} \${MAX_CONSECUTIVE_TIMEOUTS}
+ExecStart=${BIN_PATH} \${LISTEN_PORT} \${OPPO_HOST}:\${OPPO_PORT} \${TIMEOUT_SECONDS} \${MAX_CONSECUTIVE_TIMEOUTS} --protocol \${PROTOCOL}
 Restart=always
 RestartSec=2
 TimeoutStopSec=5
