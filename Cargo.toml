@@ -1,8 +1,8 @@
 [package]
 name = "oppo-multiplexer"
-version = "0.0.2"
+version = "0.0.4-pre1"
 edition = "2024"
-description = "Multiplexes client connections onto a single TCP connection to the Oppo Blu-ray Player, broadcasting unsolicited updates to all clients"
+description = "Multiplexes client connections onto a single TCP connection to the Oppo/Magnetar Blu-ray Player, broadcasting unsolicited updates to all clients"
 
 [dependencies]
 smol = "2.0.2"
