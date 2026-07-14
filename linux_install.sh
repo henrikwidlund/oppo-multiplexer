@@ -48,8 +48,8 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "This script must be run with sudo/root."
-  exit 1
+  echo "This script must run with sudo/root."
+  exec sudo "$0" "$@"
 fi
 
 BIN_DIR="/opt/oppo-multiplexer"
