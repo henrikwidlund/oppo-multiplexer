@@ -99,12 +99,16 @@ if [[ -z "${OPPO_HOST}" ]]; then
   exit 1
 fi
 
-read -r -p "Protocol (udp20x/magnetar, default udp20x): " PROTOCOL
-PROTOCOL="${PROTOCOL:-udp20x}"
-if [[ "${PROTOCOL}" != "udp20x" && "${PROTOCOL}" != "magnetar" ]]; then
-  echo "Invalid protocol: ${PROTOCOL} (expected udp20x or magnetar)"
-  exit 1
-fi
+read -r -p "Protocol (1=udp20x, 2=magnetar, default 1): " PROTOCOL_CHOICE
+PROTOCOL_CHOICE="${PROTOCOL_CHOICE:-1}"
+case "${PROTOCOL_CHOICE}" in
+  1) PROTOCOL="udp20x" ;;
+  2) PROTOCOL="magnetar" ;;
+  *)
+    echo "Invalid protocol choice: ${PROTOCOL_CHOICE} (expected 1 or 2)"
+    exit 1
+    ;;
+esac
 
 # UDP-20X players listen on port 23; Magnetar players on 8102.
 if [[ "${PROTOCOL}" == "magnetar" ]]; then
@@ -123,6 +127,9 @@ TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-10}"
 read -r -p "Max consecutive timed-out requests before reconnect (default 3): " MAX_CONSECUTIVE_TIMEOUTS
 MAX_CONSECUTIVE_TIMEOUTS="${MAX_CONSECUTIVE_TIMEOUTS:-3}"
 
+read -r -p "Log level (error/warn/info/debug/trace, default info): " LOG_LEVEL
+LOG_LEVEL="${LOG_LEVEL:-info}"
+
 if ! [[ "${OPPO_PORT}" =~ ^[0-9]+$ ]] || (( OPPO_PORT < 1 || OPPO_PORT > 65535 )); then
   echo "Invalid Player port: ${OPPO_PORT}"
   exit 1
@@ -132,13 +139,20 @@ if ! [[ "${LISTEN_PORT}" =~ ^[0-9]+$ ]] || (( LISTEN_PORT < 1 || LISTEN_PORT > 6
   exit 1
 fi
 if ! [[ "${TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid timeout seconds: ${TIMEOUT_SECONDS}"
-  exit 1
+  echo "Invalid timeout seconds: ${TIMEOUT_SECONDS}, defaulting to 10."
+  TIMEOUT_SECONDS="10"
 fi
 if ! [[ "${MAX_CONSECUTIVE_TIMEOUTS}" =~ ^[0-9]+$ ]] || (( MAX_CONSECUTIVE_TIMEOUTS < 1 || MAX_CONSECUTIVE_TIMEOUTS > 100 )); then
-  echo "Invalid max consecutive timeouts: ${MAX_CONSECUTIVE_TIMEOUTS} (must be in the range 1-100)"
-  exit 1
+  echo "Invalid max consecutive timeouts: ${MAX_CONSECUTIVE_TIMEOUTS}, defaulting to 3."
+  MAX_CONSECUTIVE_TIMEOUTS="3"
 fi
+case "${LOG_LEVEL}" in
+  error|warn|info|debug|trace) ;;
+  *)
+    echo "Invalid log level: ${LOG_LEVEL}, defaulting to info."
+    LOG_LEVEL="info"
+    ;;
+esac
 
 # Privileged ports (<1024): service runs as root.
 # Non-privileged ports: service runs as the invoking user.
@@ -192,7 +206,7 @@ LISTEN_PORT=${LISTEN_PORT}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS}
 MAX_CONSECUTIVE_TIMEOUTS=${MAX_CONSECUTIVE_TIMEOUTS}
 PROTOCOL=${PROTOCOL}
-RUST_LOG=info
+RUST_LOG=${LOG_LEVEL}
 EOCFG
 chown "root:${ENV_GROUP}" "${ENV_FILE}"
 chmod 640 "${ENV_FILE}"
