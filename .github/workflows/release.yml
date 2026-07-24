@@ -12,9 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup update stable && rustup default stable
@@ -69,9 +70,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup update stable && rustup default stable
@@ -95,7 +97,7 @@ jobs:
 
       - name: Publish
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: |
             oppo-multiplexer*.zip
@@ -105,7 +107,7 @@ jobs:
 
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: |
             oppo-multiplexer*.tar.gz
