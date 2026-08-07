@@ -1,31 +1,13 @@
-name: Build
+name: Release
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
+  release:
+    types: [ published ]
+  workflow_dispatch:
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install Rust
-        run: rustup update stable && rustup default stable
-
-      - name: Run tests
-        run: cargo test --locked
-
   release:
     name: Release native binaries
-    needs: test
     permissions:
       id-token: write
       attestations: write
@@ -96,7 +78,6 @@ jobs:
           fi
 
       - name: Publish
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
@@ -106,7 +87,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Attest build provenance
-        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: |
