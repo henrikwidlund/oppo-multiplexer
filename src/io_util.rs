@@ -4,6 +4,7 @@ use smol::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+use socket2::{SockRef, TcpKeepalive};
 use std::time::Duration;
 
 /// Hard cap on a single `\r`-terminated line from either a client or the
@@ -12,6 +13,22 @@ use std::time::Duration;
 /// practice.
 pub const MAX_LINE_LEN: usize = 4096;
 const BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const CLIENT_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Enables TCP keepalive on an accepted client socket, so a peer that goes
+/// dark without a clean FIN/RST (device sleeps, Wi-Fi drops, power loss) is
+/// detected and the read loop errors out instead of blocking forever on a
+/// half-open socket — which would otherwise leak the client's `MAX_CLIENTS`
+/// slot until the OS default keepalive (2h on Linux) finally kicks in.
+pub fn enable_client_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(CLIENT_KEEPALIVE_TIME)
+        .with_interval(CLIENT_KEEPALIVE_INTERVAL)
+        .with_retries(CLIENT_KEEPALIVE_RETRIES);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
 
 /// Bounded variant of `AsyncBufReadExt::read_until`: appends bytes into `buf`
 /// until `delim` is found or EOF, but fails with `InvalidData` if the line
