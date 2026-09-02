@@ -7,6 +7,7 @@ description = "Multiplexes client connections onto a single TCP connection to th
 [dependencies]
 smol = "2.0.2"
 futures-lite = "2.6.1"
+socket2 = { version = "0.6.5", features = ["all"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
