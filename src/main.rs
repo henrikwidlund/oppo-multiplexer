@@ -25,6 +25,7 @@ use crate::protocol::Protocol;
 
 const REQUEST_CHANNEL_CAP: usize = 32;
 const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Hard cap on concurrent accepted clients. Prevents a connection flood from
 /// spawning unbounded tasks (each holds channels + TcpStream clones). Existing
 /// clients are not affected; new ones over the cap are refused at accept time.
@@ -100,16 +101,21 @@ fn extract_protocol_flag(raw: &[String]) -> (Protocol, Vec<String>) {
 }
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("oppo-multiplexer {VERSION}");
+        return;
+    }
+
     init_logging();
 
-    let raw_args: Vec<String> = std::env::args().collect();
     // Pull the optional `--protocol <mode>` / `--protocol=<mode>` flag out of
     // argv before the positional parsing below, so it can appear anywhere and
     // the existing positional contract is unchanged. Defaults to udp20x.
     let (protocol, args) = extract_protocol_flag(&raw_args);
     if !matches!(args.len(), 4 | 5) {
         eprintln!(
-            "Usage: {} <listen_port> <backend_host:backend_port> <timeout_seconds> [max_consecutive_timeouts] [--protocol udp20x|magnetar]",
+            "Usage: {} <listen_port> <backend_host:backend_port> <timeout_seconds> [max_consecutive_timeouts] [--protocol udp20x|magnetar] [--version]",
             args[0]
         );
         std::process::exit(1);
