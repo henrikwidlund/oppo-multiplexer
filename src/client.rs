@@ -144,10 +144,12 @@ pub async fn handle_client(
         }
     }
 
-    {
+    let remaining = {
         let mut guard = lock_clients(&clients);
         guard.remove(&client_id);
-    }
+        guard.len()
+    };
 
     info!("client {peer} disconnected");
+    info!("{remaining} active client(s)");
 }

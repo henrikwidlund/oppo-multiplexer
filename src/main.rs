@@ -198,9 +198,10 @@ fn main() {
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         continue;
                     }
-                    active_clients.fetch_add(1, Ordering::AcqRel);
+                    let count = active_clients.fetch_add(1, Ordering::AcqRel) + 1;
                     let slot = ClientSlotGuard::new(Arc::clone(&active_clients));
                     info!("client {addr} connected");
+                    info!("{count} active client(s)");
                     let client_id = next_client_id;
                     next_client_id = next_client_id.wrapping_add(1);
                     spawner
