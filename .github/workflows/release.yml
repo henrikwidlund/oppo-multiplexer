@@ -6,8 +6,34 @@ on:
   workflow_dispatch:
 
 jobs:
+  check-version:
+    name: Check tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Cargo.toml
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            Cargo.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Compare tag to Cargo.toml
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          tag_version="${tag#v}"
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag=$tag (version $tag_version), Cargo.toml version=$cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::release tag '$tag' (version '$tag_version') does not match Cargo.toml version '$cargo_version'"
+            exit 1
+          fi
+
   release:
     name: Release native binaries
+    needs: check-version
     permissions:
       id-token: write
       attestations: write
