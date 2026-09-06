@@ -1,5 +1,5 @@
 use crate::backoff::Backoff;
-use crate::io_util::{MAX_LINE_LEN, read_until_capped, write_with_timeout};
+use crate::io_util::{MAX_LINE_LEN, enable_tcp_keepalive, read_until_capped, write_with_timeout};
 use crate::protocol::{
     Protocol, SYNTHETIC_UPW_OFF, SYNTHETIC_UPW_ON, is_backend_update, parse_upw_state,
     synthetic_power_state_from_exchange,
@@ -129,6 +129,11 @@ async fn try_connect(
             // Disable Nagle's algorithm — we send small commands and need low latency.
             if let Err(e) = stream.set_nodelay(true) {
                 warn!("set_nodelay on backend connection failed: {e}");
+            }
+            // Catches a half-open backend (silent black-hole) that neither
+            // protocol's app-level timeout can see — see `after_successful_write`.
+            if let Err(e) = enable_tcp_keepalive(&stream) {
+                warn!("enabling keepalive on backend connection failed: {e}");
             }
             info!("connected to backend at {addr}");
             let writer = stream.clone();
@@ -509,9 +514,9 @@ pub async fn backend_broker(
 /// engages. A half-open backend that stops accepting data without sending a
 /// FIN/RST is therefore undetectable at the application layer — the player
 /// emits no responses to time out on, and small low-rate writes keep succeeding
-/// into the kernel buffer. Genuine socket death is  still surfaced by
-/// `magnetar_backend_reader` on EOF/RST. OS-level TCP  keepalive would be the
-/// only way to catch a silent black-hole.
+/// into the kernel buffer. Genuine socket death is still surfaced by
+/// `magnetar_backend_reader` on EOF/RST, or eventually by the OS-level TCP
+/// keepalive enabled in `try_connect`.
 async fn after_successful_write(
     req: BackendRequest,
     slot: &mut ConnSlot,

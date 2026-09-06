@@ -1,5 +1,5 @@
 use crate::broker::{BackendRequest, Clients, lock_clients};
-use crate::io_util::{MAX_LINE_LEN, enable_client_keepalive, read_until_capped};
+use crate::io_util::{MAX_LINE_LEN, enable_tcp_keepalive, read_until_capped};
 use crate::protocol::Protocol;
 
 use smol::{
@@ -61,7 +61,7 @@ pub async fn handle_client(
     if let Err(e) = stream.set_nodelay(true) {
         warn!("set_nodelay on client {peer} failed: {e}");
     }
-    if let Err(e) = enable_client_keepalive(&stream) {
+    if let Err(e) = enable_tcp_keepalive(&stream) {
         warn!("enabling keepalive on client {peer} failed: {e}");
     }
 

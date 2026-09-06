@@ -13,20 +13,21 @@ use std::time::Duration;
 /// practice.
 pub const MAX_LINE_LEN: usize = 4096;
 const BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const CLIENT_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
-const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const CLIENT_KEEPALIVE_RETRIES: u32 = 3;
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
-/// Enables TCP keepalive on an accepted client socket, so a peer that goes
-/// dark without a clean FIN/RST (device sleeps, Wi-Fi drops, power loss) is
-/// detected and the read loop errors out instead of blocking forever on a
-/// half-open socket — which would otherwise leak the client's `MAX_CLIENTS`
-/// slot until the OS default keepalive (2h on Linux) finally kicks in.
-pub fn enable_client_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+/// Enables TCP keepalive on a socket, so a peer that goes dark without a
+/// clean FIN/RST (device sleeps, Wi-Fi drops, power loss,
+/// silent black-hole) is detected and the read loop errors out instead of
+/// blocking forever on a half-open socket — which would otherwise leak a
+/// client's `MAX_CLIENTS` slot, or hide a dead backend, until the OS default
+/// keepalive (2h on Linux) finally kicks in.
+pub fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     let keepalive = TcpKeepalive::new()
-        .with_time(CLIENT_KEEPALIVE_TIME)
-        .with_interval(CLIENT_KEEPALIVE_INTERVAL)
-        .with_retries(CLIENT_KEEPALIVE_RETRIES);
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
     SockRef::from(stream).set_tcp_keepalive(&keepalive)
 }
 
