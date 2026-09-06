@@ -22,7 +22,7 @@ const CLIENT_OUT_CAP: usize = 256;
 pub struct ClientSlotGuard(Arc<AtomicUsize>);
 
 impl ClientSlotGuard {
-    pub fn new(counter: Arc<AtomicUsize>) -> Self {
+    pub const fn new(counter: Arc<AtomicUsize>) -> Self {
         Self(counter)
     }
 }
@@ -55,8 +55,7 @@ pub async fn handle_client(
     let peer: Arc<str> = stream
         .peer_addr()
         .ok()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "?".to_string())
+        .map_or_else(|| "?".to_string(), |a| a.to_string())
         .into();
     if let Err(e) = stream.set_nodelay(true) {
         warn!("set_nodelay on client {peer} failed: {e}");

@@ -21,37 +21,37 @@ impl Protocol {
     /// Byte that terminates one command line arriving from a client. Oppo
     /// UDP-20X frames end in `\r`; Magnetar frames end in `\r\n`, so we delimit
     /// on the trailing `\n` and forward the whole frame verbatim.
-    pub fn client_delim(self) -> u8 {
+    pub const fn client_delim(self) -> u8 {
         match self {
-            Protocol::Udp20x => b'\r',
-            Protocol::Magnetar => b'\n',
+            Self::Udp20x => b'\r',
+            Self::Magnetar => b'\n',
         }
     }
 
     /// True when the player never answers a command on the wire, so the proxy
     /// must ack the client immediately instead of waiting for (and timing out
     /// on) a response that will never come.
-    pub fn is_fire_and_forget(self) -> bool {
-        matches!(self, Protocol::Magnetar)
+    pub const fn is_fire_and_forget(self) -> bool {
+        matches!(self, Self::Magnetar)
     }
 
     /// Bytes that terminate a line the proxy writes back to a client (currently
     /// only the `ERROR: …` notice). Matches the family's framing so the client's
     /// own line delimiter (see `client_delim`) sees a complete line: `\r` for
     /// UDP-20X, `\r\n` for Magnetar.
-    pub fn response_terminator(self) -> &'static [u8] {
+    pub const fn response_terminator(self) -> &'static [u8] {
         match self {
-            Protocol::Udp20x => b"\r",
-            Protocol::Magnetar => b"\r\n",
+            Self::Udp20x => b"\r",
+            Self::Magnetar => b"\r\n",
         }
     }
 
     /// Parses the `--protocol` value. Returns `None` for unknown modes so the
     /// caller can print a usage error.
-    pub fn parse(raw: &str) -> Option<Protocol> {
+    pub fn parse(raw: &str) -> Option<Self> {
         match raw {
-            "udp20x" => Some(Protocol::Udp20x),
-            "magnetar" => Some(Protocol::Magnetar),
+            "udp20x" => Some(Self::Udp20x),
+            "magnetar" => Some(Self::Magnetar),
             _ => None,
         }
     }

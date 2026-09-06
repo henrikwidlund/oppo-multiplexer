@@ -14,7 +14,7 @@ use smol::{
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
@@ -25,18 +25,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// in steady state (~10 req/s, no burst). Enforced by gating the broker's
 /// next request pull on `last_request_sent_at`; backend events keep flowing
 /// during the gate. Mirrors the rate limit used by the .NET Oppo client;
-/// the request channel (REQUEST_CHANNEL_CAP) is FIFO, matching the .NET
+/// the request channel (`REQUEST_CHANNEL_CAP`) is FIFO, matching the .NET
 /// `QueueProcessingOrder.OldestFirst`.
 ///
 /// Carve-out: the reconnect-and-retry path in `handle_new_request` can
-/// issue a second write < MIN_REQUEST_INTERVAL after a failed primary
+/// issue a second write < `MIN_REQUEST_INTERVAL` after a failed primary
 /// write (the failed write may have partially landed before the kernel
 /// reported the error, per `write_with_timeout`). Bounded to at most one
 /// extra write per healthy→broken transition; documented here so the
 /// steady-state guarantee is honest about this edge case. Enforcing the
 /// gate on the retry path would force a broker-blocking sleep while a
 /// freshly-spawned `backend_reader` is running, risking dropped @U??
-/// updates once BACKEND_EVENT_CAP fills — a worse trade.
+/// updates once `BACKEND_EVENT_CAP` fills — a worse trade.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A client command waiting for its backend response. `response_tx` is a
@@ -57,7 +57,7 @@ pub type Clients = Arc<Mutex<HashMap<u64, ClientEntry>>>;
 /// Locks the clients map, recovering from poison so a panicking client task
 /// cannot bring down the whole server.
 pub fn lock_clients(clients: &Clients) -> MutexGuard<'_, HashMap<u64, ClientEntry>> {
-    clients.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    clients.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// An event read from the backend by the dedicated reader task.
@@ -142,7 +142,7 @@ async fn try_connect(
             // to notice a dropped connection; everything else parses `\r` lines.
             let reader_task = match protocol {
                 Protocol::Magnetar => spawner.spawn(magnetar_backend_reader(stream, events_tx)),
-                Protocol::Udp20x => spawner.spawn(backend_reader(stream, events_tx)),
+                Protocol::Udp20x => spawner.spawn(oppo_backend_reader(stream, events_tx)),
             };
             backoff.on_success();
             Some(BackendConn {
@@ -170,7 +170,7 @@ async fn try_connect(
 /// ever one in-flight response at a time, so this path rarely fills.
 ///
 /// Exits on EOF, read error, truncated mid-line, or once `tx` is closed.
-async fn backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
+async fn oppo_backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     let mut reader = BufReader::with_capacity(256, stream);
     let mut buf = Vec::with_capacity(256);
     loop {
@@ -257,12 +257,11 @@ async fn magnetar_backend_reader(mut stream: TcpStream, tx: Sender<BackendEvent>
 /// already exited (channel closed), returns a manufactured `BackendEvent::Error`
 /// so the broker's existing "backend died" handling runs — no extra match arm
 /// needed for the channel-closed case.
+#[allow(clippy::option_if_let_else)]
 async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
     match events.recv().await {
         Ok(ev) => BrokerEvent::Backend(ev),
-        Err(_) => BrokerEvent::Backend(BackendEvent::Error(
-            "backend reader ended".to_string(),
-        )),
+        Err(_) => BrokerEvent::Backend(BackendEvent::Error("backend reader ended".to_string())),
     }
 }
 
@@ -271,10 +270,7 @@ async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
 /// backend-event arm so rate-limiting commands → player never blocks player
 /// → clients.
 fn rate_limit_remaining(last_sent_at: Option<Instant>) -> Duration {
-    match last_sent_at {
-        Some(t) => MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed()),
-        None => Duration::ZERO,
-    }
+    last_sent_at.map_or(Duration::ZERO, |t| MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed()))
 }
 
 /// Waits for the next client request. `main` holds the original `request_tx`
@@ -291,7 +287,7 @@ async fn recv_request(requests: &Receiver<BackendRequest>) -> BrokerEvent {
 /// in-flight at a time, matching the player's single-TCP-connection constraint.
 ///
 /// Each loop iteration selects from one of three modes based on
-/// (backend, in_flight) state:
+/// (backend, `in_flight`) state:
 /// - `(Some, Some)`: waiting for a response or timeout; queued updates broadcast
 ///   inline. A pre-deadline drain prevents a just-arrived response from being
 ///   discarded when the timer fires.
@@ -305,7 +301,7 @@ pub async fn backend_broker(
     clients: Clients,
     backend_addr: Arc<str>,
     timeout: Duration,
-    max_consecutive_timeouts: u32,
+    max_consecutive_timeouts: u8,
     protocol: Protocol,
     spawner: Arc<Executor<'static>>,
 ) {
@@ -318,7 +314,7 @@ pub async fn backend_broker(
         last_request_sent_at: None,
     };
     let mut last_power_state: Option<u8> = None;
-    let mut consecutive_timeouts: u32 = 0;
+    let mut consecutive_timeouts: u8 = 0;
 
     loop {
         let event = match (slot.backend.as_ref(), slot.in_flight.as_ref()) {
@@ -419,16 +415,16 @@ pub async fn backend_broker(
                     consecutive_timeouts = 0;
                     // Some power responses are acknowledged before the backend emits
                     // its own @UPW event; proactively fan out equivalent state now.
-                    if let Some(state) = synthetic_power_state_from_exchange(&req.msg, &line) {
-                        if last_power_state != Some(state) {
-                            let update: Arc<[u8]> = match state {
-                                0 => Arc::clone(&SYNTHETIC_UPW_OFF),
-                                1 => Arc::clone(&SYNTHETIC_UPW_ON),
-                                _ => unreachable!(),
-                            };
-                            broadcast_update(&clients, update);
-                            last_power_state = Some(state);
-                        }
+                    if let Some(state) = synthetic_power_state_from_exchange(&req.msg, &line)
+                        && last_power_state != Some(state)
+                    {
+                        let update: Arc<[u8]> = match state {
+                            0 => Arc::clone(&SYNTHETIC_UPW_OFF),
+                            1 => Arc::clone(&SYNTHETIC_UPW_ON),
+                            _ => unreachable!(),
+                        };
+                        broadcast_update(&clients, update);
+                        last_power_state = Some(state);
                     }
                     debug!(
                         "[backend → {}] {}",
@@ -690,12 +686,12 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
 
 /// After this many consecutive request timeouts, force backend reconnect.
 /// Smaller thresholds fail over faster; larger thresholds tolerate more transient misses.
-fn should_drop_backend_after_timeout(consecutive_timeouts: u32, max_consecutive_timeouts: u32) -> bool {
+const fn should_drop_backend_after_timeout(consecutive_timeouts: u8, max_consecutive_timeouts: u8) -> bool {
     consecutive_timeouts >= max_consecutive_timeouts
 }
 
-pub fn parse_max_consecutive_timeouts(raw: &str) -> Option<u32> {
-    let parsed = raw.trim().parse::<u32>().ok()?;
+pub fn parse_max_consecutive_timeouts(raw: &str) -> Option<u8> {
+    let parsed = raw.trim().parse::<u8>().ok()?;
     if !matches!(parsed, 1..=100) {
         return None;
     }

@@ -3,6 +3,10 @@ name = "oppo-multiplexer"
 version = "0.0.6"
 edition = "2024"
 description = "Multiplexes client connections onto a single TCP connection to the Oppo/Magnetar Blu-ray Player, broadcasting unsolicited updates to all clients"
+repository = "https://github.com/henrikwidlund/oppo-multiplexer"
+license = "MIT"
+keywords = ["oppo", "magnetar", "proxy", "multiplexer", "tcp"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 smol = "2.0.2"

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 /// Linear backoff for backend reconnect attempts. Tracks both the current
 /// wait duration and the absolute time of the next allowed attempt. Both the
-/// scheduled (ReconnectTick) path and the on-demand (handle_new_request) path
+/// scheduled (`ReconnectTick`) path and the on-demand (`handle_new_request`) path
 /// consult this single source of truth so they cannot race past each other.
 ///
 /// Sequence on repeated failures: 0.5s, 1.0s, 1.5s, ... capped at 15s.

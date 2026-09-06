@@ -48,10 +48,10 @@ pub async fn read_until_capped<R: AsyncBufRead + Unpin>(
             if available.is_empty() {
                 return Ok(buf.len() - start);
             }
-            let (n, found) = match available.iter().position(|&b| b == delim) {
-                Some(i) => (i + 1, true),
-                None => (available.len(), false),
-            };
+            let (n, found) = available
+                .iter()
+                .position(|&b| b == delim)
+                .map_or((available.len(), false), |i| (i + 1, true));
             if buf.len() - start + n > max {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,

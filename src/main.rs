@@ -24,10 +24,10 @@ use crate::client::{ClientSlotGuard, handle_client};
 use crate::protocol::Protocol;
 
 const REQUEST_CHANNEL_CAP: usize = 32;
-const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u8 = 3;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Hard cap on concurrent accepted clients. Prevents a connection flood from
-/// spawning unbounded tasks (each holds channels + TcpStream clones). Existing
+/// spawning unbounded tasks (each holds channels + `TcpStream` clones). Existing
 /// clients are not affected; new ones over the cap are refused at accept time.
 const MAX_CLIENTS: usize = 11;
 
@@ -69,6 +69,7 @@ fn init_logging() {
 /// remaining arguments — including `argv[0]` — with the flag removed so the
 /// positional parsing that follows is unaffected by flag position. Exits with a
 /// usage error on a missing or unknown mode.
+#[allow(clippy::option_if_let_else)]
 fn extract_protocol_flag(raw: &[String]) -> (Protocol, Vec<String>) {
     let mut protocol = Protocol::Udp20x;
     let mut rest = Vec::with_capacity(raw.len());
