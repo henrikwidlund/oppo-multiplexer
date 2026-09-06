@@ -73,16 +73,13 @@ pub async fn read_until_capped<R: AsyncBufRead + Unpin>(
 /// otherwise block the broker indefinitely; on timeout the caller drops the
 /// connection (since a partial write may have already landed).
 pub async fn write_with_timeout(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
-    future::or(
-        async { stream.write_all(data).await },
-        async {
-            Timer::after(BACKEND_WRITE_TIMEOUT).await;
-            Err::<(), _>(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "backend write timed out",
-            ))
-        },
-    )
+    future::or(async { stream.write_all(data).await }, async {
+        Timer::after(BACKEND_WRITE_TIMEOUT).await;
+        Err::<(), _>(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "backend write timed out",
+        ))
+    })
     .await
 }
 

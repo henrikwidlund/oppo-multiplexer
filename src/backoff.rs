@@ -30,7 +30,8 @@ impl Backoff {
 
     /// Duration until the next attempt is allowed; zero if already allowed.
     pub fn delay_until_ready(&self) -> Duration {
-        self.next_attempt_at.saturating_duration_since(Instant::now())
+        self.next_attempt_at
+            .saturating_duration_since(Instant::now())
     }
 
     pub fn on_success(&mut self) {

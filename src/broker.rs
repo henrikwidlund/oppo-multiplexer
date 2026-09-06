@@ -119,7 +119,10 @@ async fn try_connect(
         async { TcpStream::connect(addr).await.map_err(|e| e.to_string()) },
         async {
             Timer::after(CONNECT_TIMEOUT).await;
-            Err(format!("connect timed out after {}s", CONNECT_TIMEOUT.as_secs()))
+            Err(format!(
+                "connect timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
         },
     )
     .await;
@@ -270,7 +273,9 @@ async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
 /// backend-event arm so rate-limiting commands → player never blocks player
 /// → clients.
 fn rate_limit_remaining(last_sent_at: Option<Instant>) -> Duration {
-    last_sent_at.map_or(Duration::ZERO, |t| MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed()))
+    last_sent_at.map_or(Duration::ZERO, |t| {
+        MIN_REQUEST_INTERVAL.saturating_sub(t.elapsed())
+    })
 }
 
 /// Waits for the next client request. `main` holds the original `request_tx`
@@ -402,7 +407,8 @@ pub async fn backend_broker(
 
         match event {
             BrokerEvent::Request(req) => {
-                handle_new_request(req, &mut slot, &backend_addr, &spawner, protocol, timeout).await;
+                handle_new_request(req, &mut slot, &backend_addr, &spawner, protocol, timeout)
+                    .await;
             }
             BrokerEvent::Backend(BackendEvent::Line(line)) => {
                 if is_backend_update(&line) {
@@ -590,7 +596,10 @@ async fn handle_new_request(
                 return;
             }
             Err(e) => {
-                warn!("backend write error ({e}) while handling {}, reconnecting", req.peer);
+                warn!(
+                    "backend write error ({e}) while handling {}, reconnecting",
+                    req.peer
+                );
                 slot.backend = None;
                 slot.backoff.on_failure();
                 retry_after_write_fail = true;
@@ -602,13 +611,19 @@ async fn handle_new_request(
     // Path B (`retry_after_write_fail`): we just bumped backoff after losing a
     // live connection — bypass the gate this one time for the retry.
     if !retry_after_write_fail && !slot.backoff.is_ready() {
-        let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
+        let _ = req
+            .response_tx
+            .send(Err("backend unavailable".to_string()))
+            .await;
         return;
     }
 
     slot.backend = try_connect(backend_addr, spawner, &mut slot.backoff, protocol).await;
     let Some(conn) = slot.backend.as_mut() else {
-        let _ = req.response_tx.send(Err("backend unavailable".to_string())).await;
+        let _ = req
+            .response_tx
+            .send(Err("backend unavailable".to_string()))
+            .await;
         return;
     };
 
@@ -686,7 +701,10 @@ fn broadcast_update<T: Into<Arc<[u8]>>>(clients: &Clients, line: T) {
 
 /// After this many consecutive request timeouts, force backend reconnect.
 /// Smaller thresholds fail over faster; larger thresholds tolerate more transient misses.
-const fn should_drop_backend_after_timeout(consecutive_timeouts: u8, max_consecutive_timeouts: u8) -> bool {
+const fn should_drop_backend_after_timeout(
+    consecutive_timeouts: u8,
+    max_consecutive_timeouts: u8,
+) -> bool {
     consecutive_timeouts >= max_consecutive_timeouts
 }
 

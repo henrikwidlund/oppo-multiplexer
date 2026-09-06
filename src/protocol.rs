@@ -58,17 +58,8 @@ impl Protocol {
 }
 
 const UPDATE_PREFIXES: [&[u8]; 11] = [
-    b"@UPW ",
-    b"@UPL ",
-    b"@UVL ",
-    b"@UDT ",
-    b"@UAT ",
-    b"@UST ",
-    b"@UIS ",
-    b"@U3D ",
-    b"@UAR ",
-    b"@UTC ",
-    b"@UVO ",
+    b"@UPW ", b"@UPL ", b"@UVL ", b"@UDT ", b"@UAT ", b"@UST ", b"@UIS ", b"@U3D ", b"@UAR ",
+    b"@UTC ", b"@UVO ",
 ];
 
 /// Pre-built shared payloads for synthesized `@UPW` broadcasts. Avoids a heap
@@ -82,7 +73,9 @@ pub static SYNTHETIC_UPW_ON: LazyLock<Arc<[u8]>> =
 /// True if `line` is one of the player's unsolicited status updates (any of
 /// the `@U??` prefixes), as opposed to a response to an issued command.
 pub fn is_backend_update(line: &[u8]) -> bool {
-    UPDATE_PREFIXES.iter().any(|prefix| line.starts_with(prefix))
+    UPDATE_PREFIXES
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
 }
 
 pub fn parse_upw_state(line: &[u8]) -> Option<u8> {

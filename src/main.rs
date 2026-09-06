@@ -4,11 +4,7 @@ mod client;
 mod io_util;
 mod protocol;
 
-use smol::{
-    Executor,
-    channel,
-    net::TcpListener,
-};
+use smol::{Executor, channel, net::TcpListener};
 use std::{
     collections::HashMap,
     sync::{
@@ -37,13 +33,10 @@ const MAX_CLIENTS: usize = 11;
 /// systemd). Level is controlled by `RUST_LOG`, defaulting to `info`.
 fn init_logging() {
     use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     match tracing_journald::layer() {
         Ok(journald) => {
-            let subscriber = tracing_subscriber::registry()
-                .with(filter)
-                .with(journald);
+            let subscriber = tracing_subscriber::registry().with(filter).with(journald);
             tracing::subscriber::set_global_default(subscriber)
                 .expect("failed to set global tracing subscriber");
         }
@@ -59,8 +52,7 @@ fn init_logging() {
 /// Level is controlled by `RUST_LOG`, defaulting to `info`.
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
@@ -122,7 +114,10 @@ fn main() {
         std::process::exit(1);
     }
     let listen_port = args[1].parse::<u16>().unwrap_or_else(|_| {
-        eprintln!("Invalid listen_port: '{}' is not a valid TCP port (1-65535)", args[1]);
+        eprintln!(
+            "Invalid listen_port: '{}' is not a valid TCP port (1-65535)",
+            args[1]
+        );
         std::process::exit(1);
     });
     if listen_port == 0 {
@@ -134,7 +129,10 @@ fn main() {
     }
     let backend_addr: Arc<str> = args[2].as_str().into();
     let timeout_secs = args[3].parse::<u64>().unwrap_or_else(|_| {
-        eprintln!("Invalid timeout_seconds: '{}' is not a non-negative integer", args[3]);
+        eprintln!(
+            "Invalid timeout_seconds: '{}' is not a non-negative integer",
+            args[3]
+        );
         std::process::exit(1);
     });
     if timeout_secs == 0 {
