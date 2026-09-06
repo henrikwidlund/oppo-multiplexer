@@ -8,6 +8,17 @@ license = "MIT"
 keywords = ["oppo", "magnetar", "proxy", "multiplexer", "tcp"]
 categories = ["network-programming", "command-line-utilities"]
 
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+too_many_lines = "allow"
+unreachable = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+exit = "deny"
+
 [dependencies]
 smol = "2.0.2"
 futures-lite = "2.6.1"

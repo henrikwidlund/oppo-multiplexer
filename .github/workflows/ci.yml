@@ -23,7 +23,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery -W clippy::cargo -W clippy::unreachable -W clippy::dbg_macro -W clippy::todo -W clippy::unimplemented -W clippy::exit -A clippy::too_many_lines
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --locked
