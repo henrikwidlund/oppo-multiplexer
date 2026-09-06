@@ -4,6 +4,13 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit-on-push.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
       - '.github/workflows/audit-on-push.yml'
   schedule:
     - cron: '0 6 * * *'
@@ -32,4 +39,13 @@ jobs:
             cargo install --force cargo-audit
           fi;
 
+      - name: Install cargo deny
+        shell: bash
+        run: |
+          if [[ ! -x "$(command -v cargo-deny)" ]]; then
+            echo "cargo-deny not found, installing it with cargo"
+            cargo install --force cargo-deny
+          fi;
+
       - run: cargo audit
+      - run: cargo deny check
