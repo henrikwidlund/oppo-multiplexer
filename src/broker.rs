@@ -424,6 +424,7 @@ pub async fn backend_broker(
                     if let Some(state) = synthetic_power_state_from_exchange(&req.msg, &line)
                         && last_power_state != Some(state)
                     {
+                        #[allow(clippy::unreachable)] // players only ever emits 0 and 1
                         let update: Arc<[u8]> = match state {
                             0 => Arc::clone(&SYNTHETIC_UPW_OFF),
                             1 => Arc::clone(&SYNTHETIC_UPW_ON),

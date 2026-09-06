@@ -61,7 +61,7 @@ fn init_logging() {
 /// remaining arguments — including `argv[0]` — with the flag removed so the
 /// positional parsing that follows is unaffected by flag position. Exits with a
 /// usage error on a missing or unknown mode.
-#[allow(clippy::option_if_let_else)]
+#[allow(clippy::option_if_let_else, clippy::exit)]
 fn extract_protocol_flag(raw: &[String]) -> (Protocol, Vec<String>) {
     let mut protocol = Protocol::Udp20x;
     let mut rest = Vec::with_capacity(raw.len());
