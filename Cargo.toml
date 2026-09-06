@@ -1,6 +1,6 @@
 [package]
 name = "oppo-multiplexer"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 description = "Multiplexes client connections onto a single TCP connection to the Oppo/Magnetar Blu-ray Player, broadcasting unsolicited updates to all clients"
 repository = "https://github.com/henrikwidlund/oppo-multiplexer"
