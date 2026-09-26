@@ -20,7 +20,7 @@ const TCP_KEEPALIVE_RETRIES: u32 = 3;
 /// Enables TCP keepalive on a socket, so a peer that goes dark without a
 /// clean FIN/RST (device sleeps, Wi-Fi drops, power loss,
 /// silent black-hole) is detected and the read loop errors out instead of
-/// blocking forever on a half-open socket — which would otherwise leak a
+/// blocking forever on a half-open socket - which would otherwise leak a
 /// client's `MAX_CLIENTS` slot, or hide a dead backend, until the OS default
 /// keepalive (2h on Linux) finally kicks in.
 pub fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn read_until_capped_rejects_oversized_line() {
-        // 100 bytes of 'a' then \r, with max=50 — must error before crossing the cap.
+        // 100 bytes of 'a' then \r, with max=50 - must error before crossing the cap.
         let mut input = vec![b'a'; 100];
         input.push(b'\r');
         let mut reader = BufReader::with_capacity(16, Cursor::new(input));

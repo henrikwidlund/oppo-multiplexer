@@ -18,17 +18,17 @@ The binary will be at `target/release/oppo-multiplexer`.
 oppo-multiplexer <listen_port> <backend_host:backend_port> <timeout_seconds> [max_consecutive_timeouts] [--protocol udp20x|magnetar]
 ```
 
-- `listen_port` — port to accept incoming client connections on
-- `backend_host:backend_port` — address of the Oppo player
-- `timeout_seconds` — how long to wait for a response from the player before giving up
-- `max_consecutive_timeouts` — optional; reconnect backend only after this many consecutive timed-out requests (default: `3`, must be in the range `1-100`)
-- `--protocol` — optional; the player's control protocol (default: `udp20x`). One instance serves one player, so this is fixed per instance:
-  - `udp20x` — Oppo UDP-203/205 IP protocol: `#CODE\r` commands, `\r`-terminated `@…` responses, and `@U??` unsolicited updates broadcast to all clients.
-  - `magnetar` — Magnetar network protocol: `#CODE\r\n` commands. The player answers each with a bare `ack` carrying no state, so the proxy acks each client immediately without waiting for it. It still multiplexes because Magnetar, like the Oppo players, accepts only one control connection.
+- `listen_port` - port to accept incoming client connections on
+- `backend_host:backend_port` - address of the Oppo player
+- `timeout_seconds` - how long to wait for a response from the player before giving up
+- `max_consecutive_timeouts` - optional; reconnect backend only after this many consecutive timed-out requests (default: `3`, must be in the range `1-100`)
+- `--protocol` - optional; the player's control protocol (default: `udp20x`). One instance serves one player, so this is fixed per instance:
+  - `udp20x` - Oppo UDP-203/205 IP protocol: `#CODE\r` commands, `\r`-terminated `@…` responses, and `@U??` unsolicited updates broadcast to all clients.
+  - `magnetar` - Magnetar network protocol: `#CODE\r\n` commands. The player answers each with a bare `ack` carrying no state, so the proxy acks each client immediately without waiting for it. It still multiplexes because Magnetar, like the Oppo players, accepts only one control connection.
 
     On each backend connect, the proxy also sends `#APP\r\n` (undocumented handshake), which switches the player into pushing unsolicited `<message>...</message>` XML blocks with playback/volume state on that connection. These are broadcast to all clients, same as Oppo's `@U??` updates.
 
-    > **Liveness note:** because ordinary Magnetar commands get no meaningful response, there is nothing to time out on, so the `max_consecutive_timeouts` reconnect does not apply to them. A backend that dies cleanly (FIN/RST) is detected and reconnected, but a *silently black-holed* player cannot be detected at the application layer from command traffic alone — commands are ack'd even if the player never received them. This is inherent to a fire-and-forget command protocol; the metadata push, once active, does at least reveal real player state.
+    > **Liveness note:** because ordinary Magnetar commands get no meaningful response, there is nothing to time out on, so the `max_consecutive_timeouts` reconnect does not apply to them. A backend that dies cleanly (FIN/RST) is detected and reconnected, but a *silently black-holed* player cannot be detected at the application layer from command traffic alone - commands are ack'd even if the player never received them. This is inherent to a fire-and-forget command protocol; the metadata push, once active, does at least reveal real player state.
 
 Example:
 
@@ -50,7 +50,7 @@ on each `v*.*.*` tag. It is a static `scratch` image that runs as a non-root use
 
 > **Ports below 1024:** the container runs as a non-root user (UID `65532`), which
 > cannot bind privileged ports *inside* the container. Have the app listen on a high
-> port (e.g. `1024`) and use Docker's port mapping to expose it on a low host port if needed —
+> port (e.g. `1024`) and use Docker's port mapping to expose it on a low host port if needed -
 > e.g. `-p 23:1024` with `command` listening on `1024`. The `listen_port` argument is
 > the **container** port, and the left side of `-p host:container` is what clients connect to.
 

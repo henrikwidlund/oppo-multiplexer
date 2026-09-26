@@ -47,7 +47,7 @@ const MAGNETAR_MAX_PUSH_BUFFER: usize = 65536;
 /// steady-state guarantee is honest about this edge case. Enforcing the
 /// gate on the retry path would force a broker-blocking sleep while a
 /// freshly-spawned `backend_reader` is running, risking dropped @U??
-/// updates once `BACKEND_EVENT_CAP` fills — a worse trade.
+/// updates once `BACKEND_EVENT_CAP` fills - a worse trade.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A client command waiting for its backend response. `response_tx` is a
@@ -61,7 +61,7 @@ pub struct BackendRequest {
 /// Per-client state held in the broadcast map. The `TcpStream` clone is kept so
 /// that a stuck/dead client can be force-disconnected from the broadcast path,
 /// which makes both the writer and the reader half of `handle_client` error out
-/// and clean up — instead of leaving the client task running on a broken socket.
+/// and clean up - instead of leaving the client task running on a broken socket.
 pub type ClientEntry = (Sender<Arc<[u8]>>, TcpStream);
 pub type Clients = Arc<Mutex<HashMap<u64, ClientEntry>>>;
 
@@ -73,7 +73,7 @@ pub fn lock_clients(clients: &Clients) -> MutexGuard<'_, HashMap<u64, ClientEntr
 
 /// An event read from the backend by the dedicated reader task.
 enum BackendEvent {
-    /// A `\r`-terminated protocol line — either an unsolicited update or the
+    /// A `\r`-terminated protocol line - either an unsolicited update or the
     /// response to the current in-flight request.
     Line(Vec<u8>),
     /// The backend connection is no longer usable (EOF, read error, or
@@ -140,12 +140,12 @@ async fn try_connect(
 
     match result {
         Ok(stream) => {
-            // Disable Nagle's algorithm — we send small commands and need low latency.
+            // Disable Nagle's algorithm - we send small commands and need low latency.
             if let Err(e) = stream.set_nodelay(true) {
                 warn!("set_nodelay on backend connection failed: {e}");
             }
             // Catches a half-open backend (silent black-hole) that neither
-            // protocol's app-level timeout can see — see `after_successful_write`.
+            // protocol's app-level timeout can see - see `after_successful_write`.
             if let Err(e) = enable_tcp_keepalive(&stream) {
                 warn!("enabling keepalive on backend connection failed: {e}");
             }
@@ -154,7 +154,7 @@ async fn try_connect(
                 // Undocumented handshake, confirmed against a real capture: the
                 // player only starts pushing <message> metadata once it has seen
                 // #APP on this connection. Sent once per (re)connect so streaming
-                // resumes automatically — a client happening to send #APP itself
+                // resumes automatically - a client happening to send #APP itself
                 // is not something we can rely on. Treated as a connect failure
                 // like any other write_with_timeout error in this module: a
                 // connection that can't even take this first write is not usable.
@@ -168,7 +168,7 @@ async fn try_connect(
             let (events_tx, events_rx) = channel::bounded::<BackendEvent>(BACKEND_EVENT_CAP);
             // Oppo emits `\r`-terminated lines (responses and @U?? updates);
             // Magnetar emits bare `ack` lines (ignored) plus, once identified
-            // above, unsolicited <message> pushes — see `magnetar_backend_reader`.
+            // above, unsolicited <message> pushes - see `magnetar_backend_reader`.
             let reader_task = match protocol {
                 Protocol::Magnetar => spawner.spawn(magnetar_backend_reader(stream, events_tx)),
                 Protocol::Udp20x => spawner.spawn(oppo_backend_reader(stream, events_tx)),
@@ -195,7 +195,7 @@ async fn try_connect(
 /// Update lines are sent non-blocking (`try_send`): under sustained event flow
 /// they are fire-and-forget, and blocking here would propagate backpressure
 /// into the player's TCP send window. Responses and protocol errors use the
-/// awaiting `send` since they must not be silently dropped — there is only
+/// awaiting `send` since they must not be silently dropped - there is only
 /// ever one in-flight response at a time, so this path rarely fills.
 ///
 /// Exits on EOF, read error, truncated mid-line, or once `tx` is closed.
@@ -229,8 +229,8 @@ async fn oppo_backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                 let line = std::mem::replace(&mut buf, Vec::with_capacity(cap));
 
                 // Updates are fire-and-forget telemetry (a fresh @UTC arrives every
-                // second). If the broker is briefly stalled — e.g. inside a 3s
-                // try_connect — drop the update on Full instead of blocking here.
+                // second). If the broker is briefly stalled - e.g. inside a 3s
+                // try_connect - drop the update on Full instead of blocking here.
                 // Blocking would stop draining the TCP socket and could backpressure
                 // the player into stalling its own send queue.
                 //
@@ -257,12 +257,12 @@ async fn oppo_backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
 }
 
 /// Reader for the Magnetar backend. Ordinary command responses are a bare
-/// `ack` carrying no state — never parsed, just left as leading noise that
+/// `ack` carrying no state - never parsed, just left as leading noise that
 /// `extract_magnetar_message` drops along with the next message it extracts.
 /// Once `try_connect` has sent `#APP`, the player also pushes unsolicited
 /// `<message>...</message>` XML blocks with playback/volume state on the same
 /// socket, with no delimiter between consecutive blocks (confirmed against a
-/// real capture) — so each complete block found in the accumulated buffer is
+/// real capture) - so each complete block found in the accumulated buffer is
 /// forwarded to the broker as its own `BackendEvent::Line`. The broker treats
 /// every Magnetar line as an update (see `is_backend_update`): this protocol
 /// never has an in-flight request to match a response against.
@@ -310,7 +310,7 @@ async fn magnetar_backend_reader(mut stream: TcpStream, tx: Sender<BackendEvent>
 
 /// Waits for the next event from the backend reader task. If the reader has
 /// already exited (channel closed), returns a manufactured `BackendEvent::Error`
-/// so the broker's existing "backend died" handling runs — no extra match arm
+/// so the broker's existing "backend died" handling runs - no extra match arm
 /// needed for the channel-closed case.
 #[allow(clippy::option_if_let_else)]
 async fn recv_backend_event(events: &Receiver<BackendEvent>) -> BrokerEvent {
@@ -379,7 +379,7 @@ pub async fn backend_broker(
                 if Instant::now() >= *deadline {
                     // Drain pending events before declaring a timeout:
                     //   - broadcast any update lines so they aren't lost,
-                    //   - if a response is queued, use it — handles
+                    //   - if a response is queued, use it - handles
                     //     the race where the response landed just before the deadline,
                     //   - otherwise emit Timeout. Bounded by BACKEND_EVENT_CAP, so this
                     //     cannot spin past the deadline indefinitely.
@@ -425,7 +425,7 @@ pub async fn backend_broker(
                 // commands to the player faster than the rate limit allows.
                 // The backend-event arm runs concurrently with the gate, so
                 // unsolicited updates (@U??) and any other inbound lines are
-                // forwarded to clients during the cooldown — the rate limit
+                // forwarded to clients during the cooldown - the rate limit
                 // only throttles us → player, never player → us.
                 //
                 // Recreating the Timer each iteration looks like it could
@@ -435,7 +435,7 @@ pub async fn backend_broker(
                 // `rate_wait` shrinks monotonically with wall-clock. After
                 // MIN_REQUEST_INTERVAL has elapsed since the last write,
                 // `rate_wait` is `Duration::ZERO` permanently, the Timer
-                // branch is skipped, and gated_req is just `recv_request()` —
+                // branch is skipped, and gated_req is just `recv_request()` -
                 // which `future::or` polls before the event arm, so a queued
                 // request wins. Max request delay is thus MIN_REQUEST_INTERVAL.
                 let rate_wait = rate_limit_remaining(slot.last_request_sent_at);
@@ -559,7 +559,7 @@ pub async fn backend_broker(
 /// Records the outcome of a successful write to the player.
 ///
 /// For fire-and-forget protocols (Magnetar) the player never answers, so we
-/// ack the client immediately with an empty payload — `handle_client` writes
+/// ack the client immediately with an empty payload - `handle_client` writes
 /// nothing back — and keep no in-flight state. For request/response protocols
 /// the request becomes the in-flight request and its response is awaited on the
 /// broker's main loop.

@@ -58,7 +58,7 @@ fn init_logging() {
 
 /// Extracts the optional `--protocol <mode>` / `--protocol=<mode>` flag from
 /// argv, returning the selected `Protocol` (defaulting to `Udp20x`) and the
-/// remaining arguments — including `argv[0]` — with the flag removed so the
+/// remaining arguments - including `argv[0]` - with the flag removed so the
 /// positional parsing that follows is unaffected by flag position. Exits with a
 /// usage error on a missing or unknown mode.
 #[allow(clippy::option_if_let_else, clippy::exit)]
@@ -122,7 +122,7 @@ fn main() {
     });
     if listen_port == 0 {
         // Port 0 would have the OS pick an ephemeral port, but the program logs
-        // and CLI contract advertise a concrete port — accepting 0 would print a
+        // and CLI contract advertise a concrete port - accepting 0 would print a
         // misleading "listening on 0.0.0.0:0" line. Reject explicitly.
         eprintln!("Invalid listen_port: 0 is not allowed (use 1-65535)");
         std::process::exit(1);

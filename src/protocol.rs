@@ -5,16 +5,16 @@ use std::sync::{Arc, LazyLock};
 /// `--protocol`). It governs the client-command line terminator and whether the
 /// player answers commands at all.
 ///
-/// - `Udp20x` (default): the UDP-203/205 IP protocol — `#CODE\r` commands,
+/// - `Udp20x` (default): the UDP-203/205 IP protocol - `#CODE\r` commands,
 ///   `\r`-terminated `@...` responses, and `@U??` unsolicited updates.
-/// - `Magnetar`: the Magnetar network protocol — `#CODE\r\n` commands. The
+/// - `Magnetar`: the Magnetar network protocol - `#CODE\r\n` commands. The
 ///   player answers each with a bare `ack` that carries no state (ignored,
-///   same as before — the proxy still treats client commands as
+///   same as before - the proxy still treats client commands as
 ///   fire-and-forget and never waits on this). Undocumented but confirmed
 ///   against a real capture: once the proxy sends `#APP\r\n` (done once per
 ///   backend connect, see `try_connect`), the player also starts pushing
 ///   unsolicited `<message>...</message>` XML blocks with playback/volume
-///   state on the same connection — these are broadcast to every client like
+///   state on the same connection - these are broadcast to every client like
 ///   Oppo's `@U??` updates. The proxy still multiplexes it because Magnetar
 ///   allows only one control connection, same as the Oppo players.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +82,7 @@ pub static SYNTHETIC_UPW_ON: LazyLock<Arc<[u8]>> =
 ///
 /// - `Udp20x`: any of the `@U??` prefixes.
 /// - `Magnetar`: always. `magnetar_backend_reader` only ever emits complete
-///   `<message>...</message>` push blocks (see `extract_magnetar_message`) —
+///   `<message>...</message>` push blocks (see `extract_magnetar_message`) -
 ///   there is no response line to match against an in-flight request for
 ///   this protocol, so every line it produces is by construction an update.
 pub fn is_backend_update(protocol: Protocol, line: &[u8]) -> bool {
@@ -98,8 +98,8 @@ const MAGNETAR_MESSAGE_OPEN: &[u8] = b"<message>";
 const MAGNETAR_MESSAGE_CLOSE: &[u8] = b"</message>";
 
 /// Pulls one complete `<message>...</message>` span off the front of `buf`,
-/// dropping the span itself — and any leading noise before it, such as a
-/// plain `ack` line answering an ordinary command — from `buf` on success.
+/// dropping the span itself - and any leading noise before it, such as a
+/// plain `ack` line answering an ordinary command - from `buf` on success.
 /// Returns `None` if `buf` doesn't yet contain a complete message, leaving it
 /// untouched so the caller can append more bytes and retry.
 pub fn extract_magnetar_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {

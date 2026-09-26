@@ -132,7 +132,7 @@ pub async fn handle_client(
             Err(reason) => {
                 // Terminate the error line with the client's own framing so its
                 // line delimiter sees a complete line (`\r` for UDP-20X,
-                // `\r\n` for Magnetar) — not a hardcoded `\r`.
+                // `\r\n` for Magnetar) - not a hardcoded `\r`.
                 let mut line = format!("ERROR: {reason}").into_bytes();
                 line.extend_from_slice(protocol.response_terminator());
                 Arc::from(line)
