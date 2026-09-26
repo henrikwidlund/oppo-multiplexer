@@ -1,8 +1,8 @@
 use crate::backoff::Backoff;
 use crate::io_util::{MAX_LINE_LEN, enable_tcp_keepalive, read_until_capped, write_with_timeout};
 use crate::protocol::{
-    Protocol, SYNTHETIC_UPW_OFF, SYNTHETIC_UPW_ON, is_backend_update, parse_upw_state,
-    synthetic_power_state_from_exchange,
+    Protocol, SYNTHETIC_UPW_OFF, SYNTHETIC_UPW_ON, extract_magnetar_message, is_backend_update,
+    parse_upw_state, synthetic_power_state_from_exchange,
 };
 
 use futures_lite::future;
@@ -21,6 +21,17 @@ use tracing::{debug, info, warn};
 
 const BACKEND_EVENT_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Sent once per Magnetar backend connect (see `try_connect`) to switch the
+/// player into pushing `<message>` metadata on this connection.
+const MAGNETAR_IDENTIFY_COMMAND: &[u8] = b"#APP\r\n";
+/// Read chunk size for the Magnetar backend reader. Push messages observed in
+/// practice are well under this.
+const MAGNETAR_READ_CHUNK_SIZE: usize = 4096;
+/// Cap on `magnetar_backend_reader`'s accumulation buffer while waiting for a
+/// complete `<message>...</message>` block. Guards against unbounded growth if
+/// the player ever sends an open tag that never closes; real pushes are a few
+/// hundred bytes.
+const MAGNETAR_MAX_PUSH_BUFFER: usize = 65536;
 /// Minimum interval between consecutive successful writes to the player
 /// in steady state (~10 req/s, no burst). Enforced by gating the broker's
 /// next request pull on `last_request_sent_at`; backend events keep flowing
@@ -138,11 +149,26 @@ async fn try_connect(
             if let Err(e) = enable_tcp_keepalive(&stream) {
                 warn!("enabling keepalive on backend connection failed: {e}");
             }
+            let mut writer = stream.clone();
+            if matches!(protocol, Protocol::Magnetar) {
+                // Undocumented handshake, confirmed against a real capture: the
+                // player only starts pushing <message> metadata once it has seen
+                // #APP on this connection. Sent once per (re)connect so streaming
+                // resumes automatically — a client happening to send #APP itself
+                // is not something we can rely on. Treated as a connect failure
+                // like any other write_with_timeout error in this module: a
+                // connection that can't even take this first write is not usable.
+                if let Err(e) = write_with_timeout(&mut writer, MAGNETAR_IDENTIFY_COMMAND).await {
+                    warn!("failed to enable Magnetar metadata push on {addr}: {e}");
+                    backoff.on_failure();
+                    return None;
+                }
+            }
             info!("connected to backend at {addr}");
-            let writer = stream.clone();
             let (events_tx, events_rx) = channel::bounded::<BackendEvent>(BACKEND_EVENT_CAP);
-            // Magnetar sends no responses or updates, so its reader only exists
-            // to notice a dropped connection; everything else parses `\r` lines.
+            // Oppo emits `\r`-terminated lines (responses and @U?? updates);
+            // Magnetar emits bare `ack` lines (ignored) plus, once identified
+            // above, unsolicited <message> pushes — see `magnetar_backend_reader`.
             let reader_task = match protocol {
                 Protocol::Magnetar => spawner.spawn(magnetar_backend_reader(stream, events_tx)),
                 Protocol::Udp20x => spawner.spawn(oppo_backend_reader(stream, events_tx)),
@@ -211,7 +237,7 @@ async fn oppo_backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
                 // Responses and protocol errors are not fire-and-forget: we keep the
                 // awaiting send so they cannot be silently lost. At most one response
                 // can be in flight at a time, so this path rarely fills the channel.
-                if is_backend_update(&line) {
+                if is_backend_update(Protocol::Udp20x, &line) {
                     match tx.try_send(BackendEvent::Line(line)) {
                         Ok(()) | Err(TrySendError::Full(_)) => {}
                         Err(TrySendError::Closed(_)) => return,
@@ -230,13 +256,25 @@ async fn oppo_backend_reader(stream: TcpStream, tx: Sender<BackendEvent>) {
     }
 }
 
-/// Reader for the Magnetar backend: the player is fire-and-forget and emits
-/// neither command responses nor unsolicited updates, so any bytes it does send
-/// are drained and discarded. The task exists only to surface a dropped
-/// connection (EOF / read error) as a `BackendEvent::Error`, matching how
-/// `backend_reader` reports the same conditions.
+/// Reader for the Magnetar backend. Ordinary command responses are a bare
+/// `ack` carrying no state — never parsed, just left as leading noise that
+/// `extract_magnetar_message` drops along with the next message it extracts.
+/// Once `try_connect` has sent `#APP`, the player also pushes unsolicited
+/// `<message>...</message>` XML blocks with playback/volume state on the same
+/// socket, with no delimiter between consecutive blocks (confirmed against a
+/// real capture) — so each complete block found in the accumulated buffer is
+/// forwarded to the broker as its own `BackendEvent::Line`. The broker treats
+/// every Magnetar line as an update (see `is_backend_update`): this protocol
+/// never has an in-flight request to match a response against.
+///
+/// Like `oppo_backend_reader`'s update lines, forwarding uses non-blocking
+/// `try_send`: a stalled broker (e.g. inside a 3s `try_connect`) must not stop
+/// this task draining the socket.
+///
+/// Exits on EOF, read error, or once `tx` is closed.
 async fn magnetar_backend_reader(mut stream: TcpStream, tx: Sender<BackendEvent>) {
-    let mut scratch = [0u8; 256];
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; MAGNETAR_READ_CHUNK_SIZE];
     loop {
         match stream.read(&mut scratch).await {
             Ok(0) => {
@@ -245,7 +283,21 @@ async fn magnetar_backend_reader(mut stream: TcpStream, tx: Sender<BackendEvent>
                     .await;
                 return;
             }
-            Ok(_) => {}
+            Ok(n) => {
+                buf.extend_from_slice(&scratch[..n]);
+                while let Some(message) = extract_magnetar_message(&mut buf) {
+                    match tx.try_send(BackendEvent::Line(message)) {
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Closed(_)) => return,
+                    }
+                }
+                if buf.len() > MAGNETAR_MAX_PUSH_BUFFER {
+                    warn!(
+                        "Magnetar push buffer exceeded {MAGNETAR_MAX_PUSH_BUFFER} bytes without a complete message, discarding"
+                    );
+                    buf.clear();
+                }
+            }
             Err(e) => {
                 let _ = tx
                     .send(BackendEvent::Error(format!("backend read error: {e}")))
@@ -335,7 +387,7 @@ pub async fn backend_broker(
                     loop {
                         match conn.events.try_recv() {
                             Ok(BackendEvent::Line(line)) => {
-                                if is_backend_update(&line) {
+                                if is_backend_update(protocol, &line) {
                                     if let Some(state) = parse_upw_state(&line) {
                                         last_power_state = Some(state);
                                     }
@@ -411,7 +463,7 @@ pub async fn backend_broker(
                     .await;
             }
             BrokerEvent::Backend(BackendEvent::Line(line)) => {
-                if is_backend_update(&line) {
+                if is_backend_update(protocol, &line) {
                     if let Some(state) = parse_upw_state(&line) {
                         last_power_state = Some(state);
                     }

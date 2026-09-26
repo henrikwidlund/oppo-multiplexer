@@ -7,10 +7,16 @@ use std::sync::{Arc, LazyLock};
 ///
 /// - `Udp20x` (default): the UDP-203/205 IP protocol — `#CODE\r` commands,
 ///   `\r`-terminated `@...` responses, and `@U??` unsolicited updates.
-/// - `Magnetar`: the Magnetar network protocol — `#CODE\r\n` commands, and the
-///   player sends **no** response and **no** updates (fire-and-forget). The
-///   proxy still multiplexes it because Magnetar allows only one control
-///   connection, same as the Oppo players.
+/// - `Magnetar`: the Magnetar network protocol — `#CODE\r\n` commands. The
+///   player answers each with a bare `ack` that carries no state (ignored,
+///   same as before — the proxy still treats client commands as
+///   fire-and-forget and never waits on this). Undocumented but confirmed
+///   against a real capture: once the proxy sends `#APP\r\n` (done once per
+///   backend connect, see `try_connect`), the player also starts pushing
+///   unsolicited `<message>...</message>` XML blocks with playback/volume
+///   state on the same connection — these are broadcast to every client like
+///   Oppo's `@U??` updates. The proxy still multiplexes it because Magnetar
+///   allows only one control connection, same as the Oppo players.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
     Udp20x,
@@ -28,9 +34,10 @@ impl Protocol {
         }
     }
 
-    /// True when the player never answers a command on the wire, so the proxy
-    /// must ack the client immediately instead of waiting for (and timing out
-    /// on) a response that will never come.
+    /// True when the player's answer to a client command carries no usable
+    /// state (Magnetar's bare `ack`), so the proxy must ack the client
+    /// immediately instead of waiting for (and timing out on) a response it
+    /// will never match up meaningfully.
     pub const fn is_fire_and_forget(self) -> bool {
         matches!(self, Self::Magnetar)
     }
@@ -70,12 +77,43 @@ pub static SYNTHETIC_UPW_OFF: LazyLock<Arc<[u8]>> =
 pub static SYNTHETIC_UPW_ON: LazyLock<Arc<[u8]>> =
     LazyLock::new(|| Arc::from(b"@UPW 1\r".as_slice()));
 
-/// True if `line` is one of the player's unsolicited status updates (any of
-/// the `@U??` prefixes), as opposed to a response to an issued command.
-pub fn is_backend_update(line: &[u8]) -> bool {
-    UPDATE_PREFIXES
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
+/// True if `line` is one of the player's unsolicited status updates, as
+/// opposed to a response to an issued command.
+///
+/// - `Udp20x`: any of the `@U??` prefixes.
+/// - `Magnetar`: always. `magnetar_backend_reader` only ever emits complete
+///   `<message>...</message>` push blocks (see `extract_magnetar_message`) —
+///   there is no response line to match against an in-flight request for
+///   this protocol, so every line it produces is by construction an update.
+pub fn is_backend_update(protocol: Protocol, line: &[u8]) -> bool {
+    match protocol {
+        Protocol::Udp20x => UPDATE_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix)),
+        Protocol::Magnetar => true,
+    }
+}
+
+const MAGNETAR_MESSAGE_OPEN: &[u8] = b"<message>";
+const MAGNETAR_MESSAGE_CLOSE: &[u8] = b"</message>";
+
+/// Pulls one complete `<message>...</message>` span off the front of `buf`,
+/// dropping the span itself — and any leading noise before it, such as a
+/// plain `ack` line answering an ordinary command — from `buf` on success.
+/// Returns `None` if `buf` doesn't yet contain a complete message, leaving it
+/// untouched so the caller can append more bytes and retry.
+pub fn extract_magnetar_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let start = buf
+        .windows(MAGNETAR_MESSAGE_OPEN.len())
+        .position(|w| w == MAGNETAR_MESSAGE_OPEN)?;
+    let close_from = start + MAGNETAR_MESSAGE_OPEN.len();
+    let end = buf[close_from..]
+        .windows(MAGNETAR_MESSAGE_CLOSE.len())
+        .position(|w| w == MAGNETAR_MESSAGE_CLOSE)
+        .map(|p| close_from + p + MAGNETAR_MESSAGE_CLOSE.len())?;
+    let message = buf[start..end].to_vec();
+    buf.drain(..end);
+    Some(message)
 }
 
 pub fn parse_upw_state(line: &[u8]) -> Option<u8> {
@@ -125,7 +163,7 @@ mod tests {
             let mut line = prefix.to_vec();
             line.extend_from_slice(b"data\r");
             assert!(
-                is_backend_update(&line),
+                is_backend_update(Protocol::Udp20x, &line),
                 "{:?} should be an update",
                 String::from_utf8_lossy(prefix),
             );
@@ -145,11 +183,58 @@ mod tests {
         ];
         for line in cases {
             assert!(
-                !is_backend_update(line),
+                !is_backend_update(Protocol::Udp20x, line),
                 "{:?} should NOT be an update",
                 String::from_utf8_lossy(line),
             );
         }
+    }
+
+    #[test]
+    fn is_backend_update_always_true_for_magnetar() {
+        let cases: &[&[u8]] = &[
+            b"<message><operation><cmd>UpdateVolume</cmd></operation></message>",
+            b"ack",
+            b"",
+        ];
+        for line in cases {
+            assert!(
+                is_backend_update(Protocol::Magnetar, line),
+                "{:?} should be an update under Magnetar",
+                String::from_utf8_lossy(line),
+            );
+        }
+    }
+
+    #[test]
+    fn extract_magnetar_message_returns_none_on_incomplete_buffer() {
+        let mut buf = b"garbage<message><operation>".to_vec();
+        let before = buf.clone();
+        assert_eq!(extract_magnetar_message(&mut buf), None);
+        assert_eq!(buf, before, "buffer must be untouched while incomplete");
+    }
+
+    #[test]
+    fn extract_magnetar_message_extracts_single_message_and_drops_leading_noise() {
+        let mut buf =
+            b"ack\r\n<message><operation><cmd>UpdateVolume</cmd></operation></message>".to_vec();
+        let msg = extract_magnetar_message(&mut buf).expect("complete message");
+        assert_eq!(
+            msg,
+            b"<message><operation><cmd>UpdateVolume</cmd></operation></message>"
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn extract_magnetar_message_extracts_first_of_two_back_to_back_messages() {
+        let mut buf = b"<message>one</message><message>two</message>".to_vec();
+        let first = extract_magnetar_message(&mut buf).expect("first message");
+        assert_eq!(first, b"<message>one</message>");
+        assert_eq!(buf, b"<message>two</message>");
+        let second = extract_magnetar_message(&mut buf).expect("second message");
+        assert_eq!(second, b"<message>two</message>");
+        assert!(buf.is_empty());
     }
 
     #[test]

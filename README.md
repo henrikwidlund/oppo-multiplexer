@@ -24,9 +24,11 @@ oppo-multiplexer <listen_port> <backend_host:backend_port> <timeout_seconds> [ma
 - `max_consecutive_timeouts` — optional; reconnect backend only after this many consecutive timed-out requests (default: `3`, must be in the range `1-100`)
 - `--protocol` — optional; the player's control protocol (default: `udp20x`). One instance serves one player, so this is fixed per instance:
   - `udp20x` — Oppo UDP-203/205 IP protocol: `#CODE\r` commands, `\r`-terminated `@…` responses, and `@U??` unsolicited updates broadcast to all clients.
-  - `magnetar` — Magnetar network protocol: `#CODE\r\n` commands. The player is fire-and-forget (sends no responses and no unsolicited updates), so the proxy acks each client immediately. It still multiplexes because the Magnetar, like the Oppo players, accepts only one control connection.
+  - `magnetar` — Magnetar network protocol: `#CODE\r\n` commands. The player answers each with a bare `ack` carrying no state, so the proxy acks each client immediately without waiting for it. It still multiplexes because Magnetar, like the Oppo players, accepts only one control connection.
 
-    > **Liveness note:** because Magnetar sends no responses, there is nothing to time out on, so the `max_consecutive_timeouts` reconnect does not apply. A backend that dies cleanly (FIN/RST) is detected and reconnected, but a *silently black-holed* player cannot be detected at the application layer — commands are ack'd even if the player never received them. This is inherent to a fire-and-forget protocol.
+    On each backend connect, the proxy also sends `#APP\r\n` (undocumented handshake), which switches the player into pushing unsolicited `<message>...</message>` XML blocks with playback/volume state on that connection. These are broadcast to all clients, same as Oppo's `@U??` updates.
+
+    > **Liveness note:** because ordinary Magnetar commands get no meaningful response, there is nothing to time out on, so the `max_consecutive_timeouts` reconnect does not apply to them. A backend that dies cleanly (FIN/RST) is detected and reconnected, but a *silently black-holed* player cannot be detected at the application layer from command traffic alone — commands are ack'd even if the player never received them. This is inherent to a fire-and-forget command protocol; the metadata push, once active, does at least reveal real player state.
 
 Example:
 
