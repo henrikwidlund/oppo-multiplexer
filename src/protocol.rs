@@ -77,6 +77,19 @@ pub static SYNTHETIC_UPW_OFF: LazyLock<Arc<[u8]>> =
 pub static SYNTHETIC_UPW_ON: LazyLock<Arc<[u8]>> =
     LazyLock::new(|| Arc::from(b"@UPW 1\r".as_slice()));
 
+/// Broadcast to every Magnetar client when the backend connection to the
+/// player is lost (see `BrokerEvent::Backend(BackendEvent::Error(_))` in
+/// `broker.rs`). Magnetar has no real power-off push - the player simply
+/// stops sending anything and the connection between the multiplexer and
+/// the player is broken. Without this a client has no way to tell "player
+/// is off" from "proxy is still here, backend just isn't".
+/// Once the proxy itself has reconnected transparently. A distinct `<cmd>`
+/// rather than an invented `<state>` value keeps this unambiguous - clients
+/// must handle it as a dedicated case.
+pub static SYNTHETIC_MAGNETAR_POWER_OFF: LazyLock<Arc<[u8]>> = LazyLock::new(|| {
+    Arc::from(b"<message><operation><cmd>SyntheticPowerOff</cmd></operation></message>".as_slice())
+});
+
 /// True if `line` is one of the player's unsolicited status updates, as
 /// opposed to a response to an issued command.
 ///
@@ -123,6 +136,17 @@ pub fn parse_upw_state(line: &[u8]) -> Option<u8> {
         b"@UPW 1" => Some(1),
         _ => None,
     }
+}
+
+/// True if `msg` is the client command that turns a Magnetar player off (`#POF`).
+///
+/// Magnetar's ack carries no state (just a bare `ack`, same for every command), unlike Oppo's
+/// `@POF OK OFF` which `synthetic_power_state_from_exchange` inspects - so this reads the request
+/// instead of the response. Deliberately does not cover `#PON`/`#POW` (toggle): other clients see
+/// the real on-state naturally once the player boots and starts pushing `UpdatePlayState`/
+/// `UpdateVolume` again, so there is nothing those commands need to shortcut.
+pub fn is_magnetar_power_off_command(msg: &[u8]) -> bool {
+    msg.strip_suffix(b"\r\n").unwrap_or(msg) == b"#POF"
 }
 
 pub fn synthetic_power_state_from_exchange(request: &[u8], response: &[u8]) -> Option<u8> {
@@ -235,6 +259,20 @@ mod tests {
         let second = extract_magnetar_message(&mut buf).expect("second message");
         assert_eq!(second, b"<message>two</message>");
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn is_magnetar_power_off_command_recognizes_pof() {
+        assert!(is_magnetar_power_off_command(b"#POF\r\n"));
+        assert!(is_magnetar_power_off_command(b"#POF"));
+    }
+
+    #[test]
+    fn is_magnetar_power_off_command_rejects_other_commands() {
+        assert!(!is_magnetar_power_off_command(b"#PON\r\n"));
+        assert!(!is_magnetar_power_off_command(b"#POW\r\n"));
+        assert!(!is_magnetar_power_off_command(b"#APP\r\n"));
+        assert!(!is_magnetar_power_off_command(b""));
     }
 
     #[test]

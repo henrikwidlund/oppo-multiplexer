@@ -1,8 +1,9 @@
 use crate::backoff::Backoff;
 use crate::io_util::{MAX_LINE_LEN, enable_tcp_keepalive, read_until_capped, write_with_timeout};
 use crate::protocol::{
-    Protocol, SYNTHETIC_UPW_OFF, SYNTHETIC_UPW_ON, extract_magnetar_message, is_backend_update,
-    parse_upw_state, synthetic_power_state_from_exchange,
+    Protocol, SYNTHETIC_MAGNETAR_POWER_OFF, SYNTHETIC_UPW_OFF, SYNTHETIC_UPW_ON,
+    extract_magnetar_message, is_backend_update, is_magnetar_power_off_command, parse_upw_state,
+    synthetic_power_state_from_exchange,
 };
 
 use futures_lite::future;
@@ -459,8 +460,16 @@ pub async fn backend_broker(
 
         match event {
             BrokerEvent::Request(req) => {
-                handle_new_request(req, &mut slot, &backend_addr, &spawner, protocol, timeout)
-                    .await;
+                handle_new_request(
+                    req,
+                    &mut slot,
+                    &clients,
+                    &backend_addr,
+                    &spawner,
+                    protocol,
+                    timeout,
+                )
+                .await;
             }
             BrokerEvent::Backend(BackendEvent::Line(line)) => {
                 if is_backend_update(protocol, &line) {
@@ -504,6 +513,11 @@ pub async fn backend_broker(
                 slot.backoff.on_failure();
                 consecutive_timeouts = 0;
                 last_power_state = None;
+                // Magnetar only (see SYNTHETIC_MAGNETAR_POWER_OFF doc).
+                // Not needed for Oppo since it pushes events.
+                if matches!(protocol, Protocol::Magnetar) {
+                    broadcast_update(&clients, Arc::clone(&SYNTHETIC_MAGNETAR_POWER_OFF));
+                }
                 if let Some((req, _)) = slot.in_flight.take() {
                     let _ = req.response_tx.send(Err(reason)).await;
                 }
@@ -575,6 +589,7 @@ pub async fn backend_broker(
 async fn after_successful_write(
     req: BackendRequest,
     slot: &mut ConnSlot,
+    clients: &Clients,
     protocol: Protocol,
     now: Instant,
     timeout: Duration,
@@ -586,6 +601,14 @@ async fn after_successful_write(
         String::from_utf8_lossy(&req.msg).trim_end_matches(['\r', '\n'])
     );
     if protocol.is_fire_and_forget() {
+        // Magnetar only (is_fire_and_forget is Magnetar-specific) - Oppo's equivalent
+        // synthesis runs on the ack response instead (see synthetic_power_state_from_exchange),
+        // since it actually carries state. Broadcast to every client, not just req.peer:
+        // the one unreachable otherwise is any *other* client sharing this proxy, who would
+        // otherwise never learn this player just went off.
+        if matches!(protocol, Protocol::Magnetar) && is_magnetar_power_off_command(&req.msg) {
+            broadcast_update(clients, Arc::clone(&SYNTHETIC_MAGNETAR_POWER_OFF));
+        }
         let _ = req.response_tx.send(Ok(Vec::new())).await;
     } else {
         slot.in_flight = Some((req, now + timeout));
@@ -625,6 +648,7 @@ async fn after_successful_write(
 async fn handle_new_request(
     req: BackendRequest,
     slot: &mut ConnSlot,
+    clients: &Clients,
     backend_addr: &str,
     spawner: &Arc<Executor<'static>>,
     protocol: Protocol,
@@ -645,7 +669,7 @@ async fn handle_new_request(
                 // Single `now` for both the rate-limit stamp and the in-flight
                 // deadline so they share a consistent baseline.
                 let now = Instant::now();
-                after_successful_write(req, slot, protocol, now, timeout).await;
+                after_successful_write(req, slot, clients, protocol, now, timeout).await;
                 return;
             }
             Err(e) => {
@@ -692,7 +716,7 @@ async fn handle_new_request(
     match write_with_timeout(&mut conn.writer, &req.msg).await {
         Ok(()) => {
             let now = Instant::now();
-            after_successful_write(req, slot, protocol, now, timeout).await;
+            after_successful_write(req, slot, clients, protocol, now, timeout).await;
         }
         Err(e) => {
             slot.backend = None;
