@@ -105,7 +105,7 @@ mod tests {
         let mut buf = Vec::new();
         let n = future::block_on(read_until_capped(&mut reader, b'\r', &mut buf, 4096)).unwrap();
         assert_eq!(n, 0);
-        assert!(buf.is_empty());
+        assert_eq!(buf, b"");
     }
 
     #[test]

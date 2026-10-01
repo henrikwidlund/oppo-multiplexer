@@ -247,7 +247,7 @@ mod tests {
             msg,
             b"<message><operation><cmd>UpdateVolume</cmd></operation></message>"
         );
-        assert!(buf.is_empty());
+        assert_eq!(buf, b"");
     }
 
     #[test]
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(buf, b"<message>two</message>");
         let second = extract_magnetar_message(&mut buf).expect("second message");
         assert_eq!(second, b"<message>two</message>");
-        assert!(buf.is_empty());
+        assert_eq!(buf, b"");
     }
 
     #[test]
